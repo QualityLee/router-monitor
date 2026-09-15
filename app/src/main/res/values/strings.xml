@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">4G路由器监控</string>
+    <string name="hint_router_ip">路由器 LAN IP(USR-G805 默认 192.168.1.1)</string>
+    <string name="hint_password">登录密码(USR-G805 默认 admin)</string>
+    <string name="btn_login">登录并获取信息</string>
+    <string name="btn_refresh">刷新</string>
+    <string name="btn_logout">退出</string>
+    <string name="label_iccid">SIM 卡卡号 (ICCID)</string>
+    <string name="label_imei">IMEI</string>
+    <string name="label_imsi">IMSI</string>
+    <string name="label_rssi">信号强度</string>
+    <string name="label_network">网络制式</string>
+    <string name="label_operator">运营商</string>
+    <string name="label_run_time">运行时间</string>
+</resources>
