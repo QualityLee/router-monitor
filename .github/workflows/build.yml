@@ -4,6 +4,11 @@ on:
   workflow_dispatch:
   push:
     branches: [main]
+    # 纯文档改动不必编译（一次云构建好几分钟）
+    paths-ignore:
+      - '**.md'
+      - '_test_parser.py'
+      - '_lint_kt.py'
 
 permissions:
   contents: read

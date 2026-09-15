@@ -490,8 +490,11 @@ class RouterClient(hostInput: String, private val password: String) {
             if (pws.isNotEmpty()) {
                 slog("——— 密码输入框 ${pws.size} 个 ———")
                 for (p in pws) {
-                    slog("  input#${p.attr("id")} name=${p.attr("name")} class=${p.attr("class")} " +
-                            "所在表单=${if (p.form() == null) "无（靠 JS 提交）" else p.form()!!.attr("action")}")
+                    // 用 parents() 往上找 <form>，而不是 p.form() —— jsoup 1.17 的 Element 没这个方法
+                    val owner = p.parents().firstOrNull { it.tagName() == "form" }
+                    val where = if (owner == null) "无（靠 JS 提交）"
+                    else owner.attr("action").ifBlank { "(action 为空)" }
+                    slog("  input#${p.attr("id")} name=${p.attr("name")} class=${p.attr("class")} 所在表单=$where")
                 }
             }
             val scripts = doc.select("script[src]").joinToString(", ") { it.attr("src") }
