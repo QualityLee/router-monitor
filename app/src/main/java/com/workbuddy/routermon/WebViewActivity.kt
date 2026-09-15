@@ -26,6 +26,7 @@ import java.io.ByteArrayInputStream
 import java.io.File
 import java.net.HttpURLConnection
 import java.net.URL
+import java.net.URLEncoder
 
 /**
  * 网页模式 —— 这次对付 USR-G805 新 webui 的**主力方案**。
@@ -93,6 +94,34 @@ class WebViewActivity : AppCompatActivity() {
     /** 见到过多少条接口记录（用来判「钩子装了但页面一个请求都没发」） */
     private var requestsSeen = 0
 
+    // ---------------------------------------------- v1.4：子资源 ES5 降级统计
+    //
+    // 依据（2026-09-15 第二份网页模式报告）：
+    //   JS错误: Uncaught SyntaxError: Unexpected token ,  @ http://192.168.1.1/js/service.js : 315 : 31
+    // 工控机 WebView 是 Chrome 39（只认 ES5），而 service.js 第 315 行用了
+    // ES6 的对象字面量简写属性 `wifi_cur_state,` → 整个文件解析失败 → 雪崩。
+    // 所以这里对同源业务 .js 做降级，并把战果写进报告头，好一眼看出救没救活。
+
+    /** 同源 .js 被我们看过几个 */
+    @Volatile
+    private var jsSeen = 0
+
+    /** 其中确实改出内容、被替换掉的有几个 */
+    @Volatile
+    private var jsFixed = 0
+
+    /** 累计改写「对象字面量简写属性」多少处 */
+    @Volatile
+    private var es5Short = 0
+
+    /** 累计改写 let/const 多少处 */
+    @Volatile
+    private var es5Vars = 0
+
+    /** 最近一次降级的说明，写进报告头 */
+    @Volatile
+    private var lastEs5 = "未发生"
+
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -126,51 +155,40 @@ class WebViewActivity : AppCompatActivity() {
              * 「网络请求记录（0 条）」，什么都看不到。
              * 改成拦截主文档、改完再交给内核，就能保证钩子在**任何**页面脚本之前执行。
              *
-             * 只拦主文档；子资源一概放行；任何异常都返回 null 让内核正常加载，
-             * 宁可漏钩子也绝不让页面白屏。
+             * ---- v1.4 扩展 ----
+             * 同一个回调现在干两件事：
+             *   (1) 同源业务 `.js` → 抓源码跑 [Es5Fix]，**有改动才替换**，没改动交回内核（零风险）
+             *   (2) HTML 主文档    → 注入钩子（v1.3 原逻辑，一字不动）
+             *
+             * ⚠️ 分流的顺序不能反。API 21~22（Android 5.0/5.1）上
+             * `WebResourceRequest.isForMainFrame()` 有已知 bug —— **永远返回 true**，
+             * 所以根本没法靠它区分主文档和子资源，只能先按 `.js` 后缀把子资源认领走。
+             *
+             * 任何异常一律 `return null` 让内核正常加载：宁可漏一个降级、漏一个钩子，
+             * 也绝不让页面白屏。
              */
             override fun shouldInterceptRequest(
                 view: WebView?, request: WebResourceRequest?
             ): WebResourceResponse? {
                 if (done || request == null) return null
-                try {
-                    if (!request.isForMainFrame) return null
+                return try {
                     val url = request.url?.toString() ?: return null
                     if (!url.startsWith("http")) return null
+                    val path = request.url?.path ?: ""
+
+                    // ---- (1) 同源业务 .js：ES6 → ES5 降级 ----
+                    if (path.endsWith(".js") && isSameOrigin(url) && !isLibJs(path)) {
+                        return interceptJsFile(url, path)
+                    }
+
+                    // ---- (2) HTML 主文档：注入钩子（v1.3 判据，实测有效）----
                     val accept = request.requestHeaders?.get("Accept") ?: ""
-                    // 只要 HTML 主文档，js/css/图片 一概不碰
+                    // 只要 HTML 主文档，css/图片/其它子资源一概不碰
                     if (accept.isNotEmpty() && !accept.contains("text/html")) return null
-
-                    val conn = URL(url).openConnection() as HttpURLConnection
-                    conn.connectTimeout = 6000
-                    conn.readTimeout = 12000
-                    conn.setRequestProperty("User-Agent", UA)
-                    conn.setRequestProperty("Accept", "text/html,application/xhtml+xml,*/*;q=0.8")
-                    conn.setRequestProperty("Accept-Language", "zh-CN,zh;q=0.9")
-                    CookieManager.getInstance().getCookie(url)?.let {
-                        conn.setRequestProperty("Cookie", it)
-                    }
-                    val code = conn.responseCode
-                    val stream = if (code in 200..299) conn.inputStream else conn.errorStream
-                    val raw = stream?.readBytes() ?: return null
-                    val html = String(raw, Charsets.UTF_8)
-                    // 不是 HTML（二进制 / JSON / 空壳）→ 交回内核自己处理
-                    if (!Regex("(?i)<html|<body|<head|<form|<meta").containsMatchIn(html)) return null
-
-                    // 把响应里带的 Cookie 同步给 WebView，保证后续 XHR 会话一致
-                    try {
-                        val sc = conn.headerFields?.get("Set-Cookie")
-                        if (sc != null) for (c in sc) CookieManager.getInstance().setCookie(url, c)
-                    } catch (_: Exception) {
-                    }
-
-                    intercepted++
-                    lastHookInfo = "OK 已注入（主文档 ${html.length} 字节）"
-                    val body = injectHook(html).toByteArray(Charsets.UTF_8)
-                    return WebResourceResponse("text/html", "utf-8", ByteArrayInputStream(body))
+                    interceptDoc(url)
                 } catch (e: Exception) {
                     lastHookInfo = "失败: ${e.javaClass.simpleName} ${e.message}"
-                    return null
+                    null
                 }
             }
 
@@ -249,6 +267,84 @@ class WebViewActivity : AppCompatActivity() {
         netRecords.clear()
         setStatus("重新打开 http://$ip/ ...")
         web.loadUrl("http://$ip/")
+    }
+
+    // ------------------------------------------------------ 1.5 ES5 降级（v1.4 新增）
+
+    /** 是不是路由器自己身上的地址。三方 CDN 上的 js 一律不碰 */
+    private fun isSameOrigin(url: String): Boolean =
+        url.startsWith("http://$ip/") || url.startsWith("https://$ip/") ||
+                url == "http://$ip" || url == "https://$ip"
+
+    /** 第三方库（jQuery / Knockout / RequireJS 等）不可能是 ES6，省一次往返 */
+    private fun isLibJs(path: String): Boolean {
+        val low = path.lowercase()
+        return JS_LIB_MARKS.any { low.contains(it) }
+    }
+
+    /**
+     * 主文档：抓下来 → 注入钩子 → 交回内核。v1.3 原逻辑，只是从
+     * `shouldInterceptRequest` 里搬出来单独成函数。
+     */
+    private fun interceptDoc(url: String): WebResourceResponse? {
+        val conn = URL(url).openConnection() as HttpURLConnection
+        conn.connectTimeout = 6000
+        conn.readTimeout = 12000
+        conn.setRequestProperty("User-Agent", UA)
+        conn.setRequestProperty("Accept", "text/html,application/xhtml+xml,*/*;q=0.8")
+        conn.setRequestProperty("Accept-Language", "zh-CN,zh;q=0.9")
+        CookieManager.getInstance().getCookie(url)?.let {
+            conn.setRequestProperty("Cookie", it)
+        }
+        val code = conn.responseCode
+        val stream = if (code in 200..299) conn.inputStream else conn.errorStream
+        val raw = stream?.readBytes() ?: return null
+        val html = String(raw, Charsets.UTF_8)
+        // 不是 HTML（二进制 / JSON / 空壳）→ 交回内核自己处理
+        if (!Regex("(?i)<html|<body|<head|<form|<meta").containsMatchIn(html)) return null
+
+        // 把响应里带的 Cookie 同步给 WebView，保证后续 XHR 会话一致
+        try {
+            val sc = conn.headerFields?.get("Set-Cookie")
+            if (sc != null) for (c in sc) CookieManager.getInstance().setCookie(url, c)
+        } catch (_: Exception) {
+        }
+
+        intercepted++
+        lastHookInfo = "OK 已注入（主文档 ${html.length} 字节）"
+        val body = injectHook(html).toByteArray(Charsets.UTF_8)
+        return WebResourceResponse("text/html", "utf-8", ByteArrayInputStream(body))
+    }
+
+    /**
+     * 业务 .js：抓源码 → [Es5Fix] 降级 → **只在对内容有改动时**才替换。
+     *
+     * 「有改动才替换」是刻意的保守设计：
+     *   - 没改动 → `return null`，内核自己去取，我们不改变任何既有行为（零风险）
+     *   - 有改动 → 用改好的字节流顶上去，并记一笔战果
+     *
+     * 这样即使 Es5Fix 以后误判，最坏也只是**某个本来就跑不起来的文件**替换失败，
+     * 不可能把原本正常的页面搞坏。
+     */
+    private fun interceptJsFile(url: String, path: String): WebResourceResponse? {
+        val src = httpGetText(url) ?: return null
+        if (src.length < 8) return null
+        // 404 页面 / 重定向壳会被当成 .js 递过来，别原样喂回内核
+        val head = src.trimStart()
+        if (head.startsWith("<")) return null
+
+        jsSeen++
+        val r = Es5Fix.fix(src)
+        if (r.short == 0 && r.vars == 0) return null
+
+        jsFixed++
+        es5Short += r.short
+        es5Vars += r.vars
+        lastEs5 = "$path（简写属性 ${r.short} 处，let/const ${r.vars} 处，${src.length} → ${r.code.length} 字节）"
+        runOnUiThread { appendResult("  ✔ ES5 降级 $path：简写属性 ${r.short} 处，let/const ${r.vars} 处") }
+
+        val out = r.code.toByteArray(Charsets.UTF_8)
+        return WebResourceResponse("application/javascript", "utf-8", ByteArrayInputStream(out))
     }
 
     // ------------------------------------------------------------------ 1. 拦截器
@@ -734,6 +830,49 @@ class WebViewActivity : AppCompatActivity() {
         "html5shiv", "respond.min", "base64"
     )
 
+    /**
+     * 上一版单文件只抓 25,000 字符 —— 而 `js/service.js` 原始 279,404 字符，
+     * **只回来 8.9%**，`getStatusInfo` 里定义 cmd 的那段正好落在被截断区里。
+     * 白采一轮，这是本轮必须修掉的采集短板。
+     */
+    private val JS_FULL_CAP = 900_000
+
+    /** 但报告里每个文件只 dump 前这么多字符，否则报告会长到没法看 */
+    private val JS_DUMP_CAP = 30_000
+
+    /** 最多抓几个业务 JS */
+    private val JS_MAX_FILES = 18
+
+    /**
+     * `cmd = "xxx"` / `cmd : "xxx"` / `requestParams.cmd = "xxx"` ——
+     * 取到的就是 GET /reqproc/proc_get 的字段列表。
+     *
+     * 用负向后顾 `(?<!\w)`，而不是「前一个字符属于某集合」的写法 ——
+     * 后者会把 `requestParams.cmd` 这种**前面是点**的形式整片漏掉。
+     */
+    private val CMD_RE = Regex("""(?<!\w)["']?cmd["']?\s*[:=]\s*["']([^"']{1,300})["']""")
+
+    /** `goformId = "xxx"` —— 写操作（POST /reqproc/proc_post），**只列不调** */
+    private val GOFORM_RE = Regex("""(?<!\w)["']?goformId["']?\s*[:=]\s*["']([^"']{1,300})["']""")
+
+    /** 源码里出现的接口路径 */
+    private val PROC_RE = Regex("""["'](/(?:reqproc|goform|cgi-bin)/[A-Za-z0-9_\-]{1,40})["']""")
+
+    /**
+     * 兜底的候选 cmd：万一源码里挖不到（比如 cmd 是拼出来的），拿这些赌一把。
+     * **全是只读字段名，对应的都是 GET**，不会改路由器任何配置。
+     */
+    private val FALLBACK_CMDS = listOf(
+        "iccid", "sim_iccid", "sim_iccid_state", "sim_status", "sim_state",
+        "network_type", "signal_strength", "signalbar", "rssi", "rsrp", "sinr",
+        "network_operator", "wan_ipaddr", "current_network_mode",
+        "m_netselect_status", "station_list", "lan_station_list",
+        "m_ssid_enable,wifi_cur_state"
+    )
+
+    /** 一次 JS 采集的产物：报告片段 + 从全量文本里挖出来的接口 */
+    private class JsHarvest(val dump: String, val cmds: List<String>, val paths: List<String>)
+
     /** 同源 GET 一份文本（带 WebView 当前的 Cookie，保证和页面同一个会话） */
     private fun httpGetText(url: String): String? {
         return try {
@@ -754,30 +893,172 @@ class WebViewActivity : AppCompatActivity() {
         }
     }
 
-    /** 逐个拉取业务 JS 源码，拼成报告里的一段。**必须在子线程调用** */
-    private fun fetchAppJs(scriptUrls: List<String>): String {
-        val sb = StringBuilder()
+    /**
+     * 逐个拉取业务 JS 源码。**必须在子线程调用**
+     *
+     * v1.4 改动：
+     *   - 单文件上限 25,000 → [JS_FULL_CAP]（service.js 有 279 KB）
+     *   - 文件数 12 → [JS_MAX_FILES]
+     *   - **全量文本只用来挖接口**，报告里每段仍只 dump [JS_DUMP_CAP] 字符（报告不能炸）
+     */
+    private fun fetchAppJs(scriptUrls: List<String>): JsHarvest {
+        val dump = StringBuilder()
+        val full = StringBuilder()
         var n = 0
         for (s in scriptUrls) {
             if (s.isBlank()) continue
             val low = s.lowercase()
             if (!low.contains(".js")) continue
             if (JS_LIB_MARKS.any { low.contains(it) }) continue
-            if (n >= 12) break
+            if (n >= JS_MAX_FILES) break
             val u = if (s.startsWith("http")) s else "http://$ip/" + s.trimStart('/')
-            val src = httpGetText(u)
-            if (src.isNullOrBlank()) {
+            val raw = httpGetText(u)
+            if (raw.isNullOrBlank()) {
                 runOnUiThread { appendResult("  JS 取不到: $u") }
                 continue
             }
             n++
-            sb.append("\n----- ").append(u).append("  (长度 ").append(src.length).append(") -----\n")
-            sb.append(if (src.length > 25000) src.substring(0, 25000) + "\n...[已截断]" else src)
-            sb.append('\n')
-            runOnUiThread { appendResult("  已取 $u（${src.length} 字节）") }
+            val src = if (raw.length > JS_FULL_CAP) raw.substring(0, JS_FULL_CAP) else raw
+            full.append(src).append('\n')
+
+            dump.append("\n----- ").append(u).append("  (长度 ").append(raw.length)
+            if (src.length < raw.length) dump.append("，仅取前 ").append(JS_FULL_CAP)
+            dump.append(") -----\n")
+            dump.append(
+                if (src.length > JS_DUMP_CAP)
+                    src.substring(0, JS_DUMP_CAP) + "\n...[本段已省略；完整内容已用于挖接口，见上面「接口清单」]"
+                else src
+            )
+            dump.append('\n')
+            runOnUiThread { appendResult("  已取 $u（${raw.length} 字节）") }
         }
+
+        val mined = extractInterfaces(full.toString())
+        return JsHarvest(mined.text + dump.toString(), mined.cmds, mined.paths)
+    }
+
+    private class Mined(val text: String, val cmds: List<String>, val paths: List<String>)
+
+    /**
+     * 从**全量** JS 文本里把后端接口挖出来。
+     *
+     * 这是本轮的重点：上一版因为 25,000 字符截断，`getStatusInfo` 里
+     * `requestParams.cmd = "..."` 那些定义全被切掉了，等于什么都没挖到。
+     */
+    private fun extractInterfaces(js: String): Mined {
+        val cmds = LinkedHashSet<String>()
+        val forms = LinkedHashSet<String>()
+        val paths = LinkedHashSet<String>()
+        for (m in CMD_RE.findAll(js)) {
+            val v = m.groupValues[1].trim()
+            if (v.isNotEmpty() && v.length <= 300) cmds.add(v)
+        }
+        for (m in GOFORM_RE.findAll(js)) {
+            val v = m.groupValues[1].trim()
+            if (v.isNotEmpty()) forms.add(v)
+        }
+        for (m in PROC_RE.findAll(js)) paths.add(m.groupValues[1])
+
+        val sb = StringBuilder()
+        sb.append("\n===== 提取到的接口清单（从全量 JS 挖的）=====\n")
+        sb.append("接口路径 ").append(paths.size).append(" 个: ")
+        sb.append(if (paths.isEmpty()) "(无)" else paths.joinToString("  "))
+        sb.append('\n')
+
+        sb.append("cmd 取值 ").append(cmds.size).append(" 个（读 → GET /reqproc/proc_get?cmd=<值>）:\n")
+        if (cmds.isEmpty()) sb.append("  (无)\n")
+        else {
+            val lim = cmds.take(80)
+            lim.forEach { sb.append("  · ").append(it).append('\n') }
+            if (cmds.size > lim.size) sb.append("  …还有 ").append(cmds.size - lim.size).append(" 个\n")
+        }
+
+        sb.append("goformId 取值 ").append(forms.size).append(" 个（写 → POST /reqproc/proc_post，只列不调）:\n")
+        if (forms.isEmpty()) sb.append("  (无)\n")
+        else {
+            val lim = forms.take(60)
+            lim.forEach { sb.append("  · ").append(it).append('\n') }
+            if (forms.size > lim.size) sb.append("  …还有 ").append(forms.size - lim.size).append(" 个\n")
+        }
+        return Mined(sb.toString(), cmds.toList(), paths.toList())
+    }
+
+    // ------------------------------------------------- 2.5 原生直连实测（v1.4 新增）
+
+    /** 同源 GET，带状态码。返回 (状态码, 响应体, Content-Type) —— 探测专用 */
+    private fun httpProbe(url: String): Triple<Int, String, String>? {
+        return try {
+            val conn = URL(url).openConnection() as HttpURLConnection
+            conn.connectTimeout = 6000
+            conn.readTimeout = 12000
+            conn.setRequestProperty("User-Agent", UA)
+            conn.setRequestProperty("Referer", "http://$ip/")
+            conn.setRequestProperty("Accept", "*/*")
+            conn.setRequestProperty("X-Requested-With", "XMLHttpRequest")
+            CookieManager.getInstance().getCookie(url)?.let {
+                conn.setRequestProperty("Cookie", it)
+            }
+            val code = conn.responseCode
+            val st = if (code in 200..299) conn.inputStream else conn.errorStream
+            val bytes = st?.readBytes() ?: ByteArray(0)
+            Triple(code, String(bytes, Charsets.UTF_8), conn.contentType ?: "")
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    /**
+     * **原生直连实测 `/reqproc/proc_get`** —— 这才是本轮真正的杀手锏。
+     *
+     * 协议是从 `js/service.js` 源码里读出来的（不是猜的）：
+     * ```js
+     * url : isPost ? "/reqproc/proc_post"
+     *              : params.cmd ? "/reqproc/proc_get"   // 有 cmd → GET（读）
+     *              : "/reqproc/proc_post"               // 有 goformId → POST（写）
+     * data : params
+     * ```
+     * 也就是说**读操作就是** `GET /reqproc/proc_get?cmd=<逗号分隔的字段名列表>`。
+     * 只要这一发能返回 JSON，信号值/ICCID 就直接拿到了 —— 连 WebView 都不用，
+     * 后续的 App 根本不需要跑页面。
+     *
+     * ⚠️ 安全边界：**只发 GET**。写操作走 `proc_post`，一个都不发。
+     */
+    private fun probeProcGet(cmds: List<String>): String {
+        val sb = StringBuilder()
+        sb.append("\n===== 原生直连实测 GET /reqproc/proc_get =====\n")
+        sb.append("（只读探测；写接口 proc_post / cgi-bin 一律不碰）\n")
+
+        val todo = ArrayList<String>()
+        for (c in cmds) if (c.isNotBlank() && !todo.contains(c)) todo.add(c)
+        for (c in FALLBACK_CMDS) if (!todo.contains(c)) todo.add(c)
+
+        val list = todo.take(40)
+        if (todo.size > list.size) sb.append("候选 ").append(todo.size).append(" 个，只打前 40 个\n")
+        else sb.append("候选 ").append(list.size).append(" 个\n")
+
+        var ok = 0
+        var json = 0
+        for ((i, c) in list.withIndex()) {
+            val u = "http://$ip/reqproc/proc_get?cmd=" + URLEncoder.encode(c, "UTF-8")
+            val r = httpProbe(u)
+            if (r == null) {
+                sb.append("\n#").append(i + 1).append(" cmd=").append(c).append("\n    → 连接失败\n")
+                continue
+            }
+            val t = r.second.trim()
+            sb.append("\n#").append(i + 1).append(" cmd=").append(c)
+                .append("   → HTTP ").append(r.first)
+                .append("  (").append(r.second.length).append(" 字节")
+                .append(if (r.third.isNotBlank()) " " + r.third.substringBefore(';') else "").append(")\n")
+            sb.append("    ").append(t.take(900).replace("\n", "\n    ")).append('\n')
+            if (r.first in 200..299) ok++
+            if (t.startsWith("{") || t.startsWith("[")) json++
+        }
+        sb.append("\n结论: ").append(list.size).append(" 个候选中 ")
+            .append(ok).append(" 个返回 2xx，").append(json).append(" 个是 JSON\n")
         return sb.toString()
     }
+
 
     private fun buildAndSave() {
         done = true
@@ -792,23 +1073,44 @@ class WebViewActivity : AppCompatActivity() {
                     u.contains(".js") && JS_LIB_MARKS.none { u.lowercase().contains(it) }
                 }
                 appendResult("正在拉取业务 JS 源码（${appUrls.size} 个）...")
-                // 拉 JS 要联网，必须离开 UI 线程
+                // 拉 JS / 探测接口都要联网，必须离开 UI 线程
                 Thread {
-                    val jsDump = fetchAppJs(urls)
-                    runOnUiThread { writeReport(errs, urls, jsDump) }
+                    val js = try {
+                        fetchAppJs(urls)
+                    } catch (e: Exception) {
+                        JsHarvest("\n(JS 采集异常: ${e.javaClass.simpleName} ${e.message})\n", emptyList(), emptyList())
+                    }
+                    runOnUiThread { appendResult("正在原生直连实测 /reqproc/proc_get ...") }
+                    val probe = try {
+                        probeProcGet(js.cmds)
+                    } catch (e: Exception) {
+                        "\n(proc_get 探测异常: ${e.javaClass.simpleName} ${e.message})\n"
+                    }
+                    runOnUiThread { writeReport(errs, urls, js, probe) }
                 }.start()
             }
         }
     }
 
-    private fun writeReport(errs: JSONArray?, scriptUrls: List<String>, jsDump: String) {
+    private fun writeReport(
+        errs: JSONArray?,
+        scriptUrls: List<String>,
+        js: JsHarvest,
+        probe: String
+    ) {
         val sb = StringBuilder()
         sb.append("===== 网页模式全量诊断 =====\n")
         sb.append("目标: http://").append(ip).append("/\n")
-        sb.append("版本: v1.3\n")
+        sb.append("版本: v1.4\n")
         sb.append("已登录: ").append(loggedIn).append("   密码长度: ").append(pwd.length).append('\n')
         sb.append("拦截器: ").append(if (hookSeen) "已挂上 __wbHooked ✓" else "✗ 没挂上（接口记录为空是正常的）").append('\n')
         sb.append("主文档注入: ").append(lastHookInfo).append("（").append(intercepted).append(" 次）\n")
+        sb.append("子资源 JS 拦截: 看过 ").append(jsSeen).append(" 个 / ES5 降级 ").append(jsFixed).append(" 个")
+            .append("（简写属性 ").append(es5Short).append(" 处，let/const ").append(es5Vars).append(" 处）\n")
+        sb.append("最近一次降级: ").append(lastEs5).append('\n')
+        if (jsSeen == 0) {
+            sb.append("  ↳ ⚠ 一个同源 .js 都没被拦到 —— 页面跑的仍是原始 ES6，Chrome 39 还是会把它整段丢弃\n")
+        }
         sb.append("页面加载脚本: ").append(scriptUrls.size).append(" 个\n")
         val errCount = errs?.length() ?: 0
         sb.append("页面 JS 错误: ").append(errCount).append(" 条\n")
@@ -828,9 +1130,13 @@ class WebViewActivity : AppCompatActivity() {
             netRecords.forEachIndexed { i, s -> sb.append("\n#").append(i + 1).append(' ').append(s).append('\n') }
         }
 
-        if (jsDump.isNotBlank()) {
+        if (probe.isNotBlank()) sb.append(probe)
+
+        if (js.dump.isNotBlank()) {
             sb.append("\n===== 业务 JS 源码（后端接口地址就写在里面）=====")
-            sb.append(jsDump)
+            sb.append(js.dump)
+            // 显式结束标记：上一版没有它，报告解析时最后一段 JS 会把「页面快照」整段吞掉
+            sb.append("\n----- 业务 JS 源码结束 -----\n")
         }
 
         sb.append("\n----- 页面快照 -----\n").append(snapshots)

@@ -111,6 +111,44 @@ class RouterClient(hostInput: String, private val password: String) {
 
         private const val MAX_JS_FETCH = 16
 
+        // ------------------------------------------------ v1.4：G805 真实协议
+        //
+        // 从 `js/service.js` 源码里读出来的（不是猜的）：
+        //   $.ajax({ type : !!isPost ? "POST" : "GET",
+        //            url  : isPost ? "/reqproc/proc_post"
+        //                         : params.cmd ? "/reqproc/proc_get"   // 有 cmd  → GET（读）
+        //                         : "/reqproc/proc_post",              // 有 goformId → POST（写）
+        //            data : params, dataType : "json", cache : false });
+        //
+        // 也就是 **读操作 = GET /reqproc/proc_get?cmd=<逗号分隔的字段名列表>**。
+        // 这条路完全不依赖页面 JS —— 哪怕 Chrome 39 跑不动那个 ES6 的 service.js，
+        // 只要 cmd 列表对了，一个 GET 就能把信号值 / ICCID / 运营商全拿回来。
+
+        /** 读接口（唯一会主动打的原生接口） */
+        private const val PROC_GET = "/reqproc/proc_get"
+
+        /**
+         * `cmd = "xxx"` / `cmd : "xxx"` / `requestParams.cmd = "xxx"`
+         *
+         * 用负向后顾 `(?<!\w)` 而不是「前一个字符属于某集合」的写法 ——
+         * 后者会把 `requestParams.cmd` 这种**前面是点**的形式整片漏掉（点也在排除集里）。
+         */
+        private val CMD_RE = Regex("""(?<!\w)["']?cmd["']?\s*[:=]\s*["']([^"']{1,300})["']""")
+
+        /** `goformId = "xxx"` —— 写操作，**只列出、绝不调用** */
+        private val GOFORM_RE = Regex("""(?<!\w)["']?goformId["']?\s*[:=]\s*["']([^"']{1,300})["']""")
+
+        private val PATH_RE = Regex("""["'](/(?:reqproc|goform|cgi-bin)/[A-Za-z0-9_\-]{1,40})["']""")
+
+        /** 兜底字段名（全是只读字段，对应 GET；不会改路由器任何配置） */
+        private val FALLBACK_CMDS = listOf(
+            "iccid", "sim_iccid", "sim_iccid_state", "sim_status", "sim_state",
+            "network_type", "signal_strength", "signalbar", "rssi", "rsrp", "sinr",
+            "network_operator", "wan_ipaddr", "current_network_mode",
+            "m_netselect_status", "station_list", "lan_station_list",
+            "m_ssid_enable,wifi_cur_state"
+        )
+
         /**
          * 接口名里有这些词 → 只读接口，做探测性 POST 是安全的。
          *
@@ -143,6 +181,9 @@ class RouterClient(hostInput: String, private val password: String) {
 
     /** 成功抓到的业务 JS URL（按抓取顺序），供 jsDump() 单独输出 */
     private val jsUrls = ArrayList<String>()
+
+    /** v1.4：原生直连 GET /reqproc/proc_get 的探测结果，逐条进报告 */
+    private val procLog = ArrayList<String>()
 
     /**
      * 真正的首页。GET / 可能只是个 JS 跳转壳（G805 就是），要跟到最终页面。
@@ -829,6 +870,18 @@ class RouterClient(hostInput: String, private val password: String) {
             }
         }
 
+        // ---- ★ v1.4：已逆出的 G805 真实读接口，最后直连打一发 ----
+        // 依据 js/service.js：读 = GET /reqproc/proc_get?cmd=<逗号分隔的字段名列表>。
+        // 这条路不依赖页面 JS，所以是多出来的、独立于「网页模式」的一条生路。
+        if (!info.hasData() || info.iccid == "--") {
+            if (jsUrls.isEmpty()) mineEndpoints()   // 先保证业务 JS 已到手，才有 cmd 可挖
+            probeG805ProcGet()
+            val pl = procLog.joinToString("\n")
+            if (pl.isNotBlank()) {
+                HtmlParser.merge(info, HtmlParser.parsePage(pl, "proc_get"))
+            }
+        }
+
         if (!info.hasData()) {
             probeCgiInterfaces()
             val probeCorpus = postLog.joinToString("\n")
@@ -842,8 +895,12 @@ class RouterClient(hostInput: String, private val password: String) {
         }
 
         if (!info.hasData() && spaDetected) {
-            slog("★ 结论：这是 JS 单页应用，纯 HTTP 请求拿不到数据。")
-            slog("  → 请点【网页模式(推荐)】，让真浏览器内核跑完页面 JS 再抓取。")
+            slog("★ 结论：这是 JS 单页应用，静态 HTML 里一个数据都没有。")
+            if (procLog.isNotEmpty()) {
+                slog("  已按从 JS 逆出的协议直连试过 GET $PROC_GET（${procLog.size} 个候选 cmd 已实打）")
+                slog("  逐条结果见报告「原生直连实测 GET /reqproc/proc_get」段。")
+            }
+            slog("  → 也可以点【网页模式(推荐)】，让真浏览器内核跑完页面 JS 再抓。")
         }
 
         info.rawHtml = corpus.toString()
@@ -1018,17 +1075,131 @@ class RouterClient(hostInput: String, private val password: String) {
         return norm.toList()
     }
 
+    // ------------------------------------------------- v1.4：G805 原生直连
+
+    /**
+     * 直接打 G805 的真实数据接口 `/reqproc/proc_get`。
+     *
+     * 协议是从 `js/service.js` 源码里**读出来的**（见 [PROC_GET] 处注释）。
+     * 为什么它最值钱：**完全不依赖页面 JS**。G805 的业务 JS 里有 ES6 语法，
+     * 工控机的 Chrome 39 解析不了 → 页面整段失效；但只要 cmd 列表对了，
+     * 这一个 GET 就能把信号值 / ICCID / 运营商全拿回来。
+     *
+     * ⚠️ 安全边界：**只发 GET**。写操作走 `proc_post`，一个都不发。
+     */
+    private fun probeG805ProcGet() {
+        slog("——— 原生直连探测 GET $PROC_GET（v1.4）———")
+
+        val cmds = LinkedHashSet<String>()
+        for ((_, body) in pages) {
+            if (body.isBlank()) continue
+            for (m in CMD_RE.findAll(body)) {
+                val v = m.groupValues[1].trim()
+                if (v.isNotEmpty() && v.length <= 300) cmds.add(v)
+            }
+        }
+        val fromJs = cmds.size
+        for (c in FALLBACK_CMDS) cmds.add(c)
+
+        val list = cmds.toList().take(40)
+        slog("  已抓语料里挖到 cmd $fromJs 个，加兜底候选共 ${cmds.size} 个；本次实打 ${list.size} 个")
+
+        var ok = 0
+        var json = 0
+        for ((i, c) in list.withIndex()) {
+            val u = "$PROC_GET?cmd=" + enc(c)
+            val r = try {
+                get(u)
+            } catch (e: Exception) {
+                procLog.add("#${i + 1} cmd=$c\n    → 连接异常: ${e.message}")
+                continue
+            }
+            val t = r.body.trim()
+            val head = "#${i + 1} cmd=$c   → HTTP ${r.code}  (${r.body.length} 字节)"
+            procLog.add(if (t.isEmpty()) head else "$head\n" + t.take(1200))
+            if (r.code in 200..299) ok++
+            if (t.startsWith("{") || t.startsWith("[")) {
+                json++
+                if (looksLikeG805Data(t)) slog("  ★★ cmd=$c 返回了 JSON 且含真实数据字段 —— $t")
+            }
+        }
+        slog("  结果: ${list.size} 个候选中 $ok 个返回 2xx，$json 个返回 JSON")
+        if (json == 0) slog("  若全是 404/空，说明 cmd 名不对；把报告发我，从完整 service.js 里再挖一轮")
+    }
+
+    /** JSON 里出现这些键名，说明真的摸到数据了（而不是错误对象） */
+    private fun looksLikeG805Data(t: String): Boolean {
+        val low = t.lowercase()
+        return listOf("iccid", "rssi", "rsrp", "sinr", "signal", "imei", "imsi", "operator")
+            .any { low.contains(it) }
+    }
+
+    /**
+     * 把从已抓语料里挖到的接口路径 / cmd / goformId 列成清单。
+     * 这是上一版缺的一段：只 dump JS 源码，没把「到底有哪些接口」汇总出来。
+     */
+    private fun interfaceDump(): String {
+        val cmds = LinkedHashSet<String>()
+        val forms = LinkedHashSet<String>()
+        val paths = LinkedHashSet<String>()
+        for ((_, body) in pages) {
+            if (body.isBlank()) continue
+            for (m in CMD_RE.findAll(body)) {
+                val v = m.groupValues[1].trim()
+                if (v.isNotEmpty()) cmds.add(v)
+            }
+            for (m in GOFORM_RE.findAll(body)) {
+                val v = m.groupValues[1].trim()
+                if (v.isNotEmpty()) forms.add(v)
+            }
+            for (m in PATH_RE.findAll(body)) paths.add(m.groupValues[1])
+        }
+
+        val sb = StringBuilder()
+        sb.append("\n\n===== 提取到的接口清单（v1.4）=====\n")
+        sb.append("接口路径 ").append(paths.size).append(" 个: ")
+        sb.append(if (paths.isEmpty()) "(无)" else paths.joinToString("  "))
+        sb.append('\n')
+
+        sb.append("cmd 取值 ").append(cmds.size).append(" 个（读 → GET ").append(PROC_GET).append("?cmd=<值>）:\n")
+        if (cmds.isEmpty()) sb.append("  (无)\n")
+        else {
+            val lim = cmds.take(80)
+            lim.forEach { sb.append("  · ").append(it).append('\n') }
+            if (cmds.size > lim.size) sb.append("  …还有 ").append(cmds.size - lim.size).append(" 个\n")
+        }
+
+        sb.append("goformId 取值 ").append(forms.size).append(" 个（写 → POST /reqproc/proc_post，只列不调）:\n")
+        if (forms.isEmpty()) sb.append("  (无)\n")
+        else {
+            val lim = forms.take(60)
+            lim.forEach { sb.append("  · ").append(it).append('\n') }
+            if (forms.size > lim.size) sb.append("  …还有 ").append(forms.size - lim.size).append(" 个\n")
+        }
+        return sb.toString()
+    }
+
     /**
      * 业务 JS 源码单独成段输出。
      *
      * 这是本轮最重要的新增：G805 的接口地址、参数名、返回结构全写在这些 JS 里，
      * 而它们都是静态文件、**不需要登录**就能取到 —— 拿到它们等于拿到了接口说明书。
      * 只输出业务 JS（跳过 jquery / knockout 这些框架），每份截 maxPer。
+     *
+     * v1.4 起，这段前面还会先附上「接口清单」和「原生直连实测 /reqproc/proc_get」。
      */
     fun jsDump(maxPer: Int = 25000, maxFiles: Int = 12): String {
-        val picked = jsUrls.filter { pages.containsKey(it) }
-        if (picked.isEmpty()) return ""
         val sb = StringBuilder()
+        sb.append(interfaceDump())
+
+        if (procLog.isNotEmpty()) {
+            sb.append("\n\n===== 原生直连实测 GET ").append(PROC_GET).append("（v1.4）=====\n")
+            sb.append("（只读探测；写接口 proc_post / cgi-bin 未做任何请求）\n")
+            sb.append(procLog.joinToString("\n")).append('\n')
+        }
+
+        val picked = jsUrls.filter { pages.containsKey(it) }
+        if (picked.isEmpty()) return sb.toString()
         sb.append("\n\n===== 业务 JS 源码（后端接口地址就写在里面）=====\n")
         var n = 0
         for (u in picked) {
@@ -1039,6 +1210,7 @@ class RouterClient(hostInput: String, private val password: String) {
             sb.append(if (b.length > maxPer) b.substring(0, maxPer) + "\n...[已截断]" else b)
             sb.append('\n')
         }
+        sb.append("\n----- 业务 JS 源码结束 -----\n")
         return sb.toString()
     }
 
