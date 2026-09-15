@@ -11,7 +11,7 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 40
 
     steps:
       - name: Checkout
@@ -23,18 +23,33 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
-
-      - name: Install SDK packages
+      # NOTE: do NOT use android-actions/setup-android -- it runs `sdkmanager tools`
+      # which no longer exists and hard-fails. The ubuntu runner image already
+      # ships with an Android SDK, we just add the packages we need.
+      - name: Install Android SDK packages
         run: |
-          yes | sdkmanager --licenses > /dev/null 2>&1 || true
-          sdkmanager "platform-tools" "platforms;android-34" "build-tools;34.0.0"
+          set -e
           echo "ANDROID_HOME=$ANDROID_HOME"
-          ls "$ANDROID_HOME/platforms"
+          echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT"
+
+          SDKMGR="$(command -v sdkmanager || true)"
+          if [ -z "$SDKMGR" ]; then
+            SDKMGR="$(find "$ANDROID_HOME/cmdline-tools" "$ANDROID_SDK_ROOT/cmdline-tools" \
+                      -type f -name sdkmanager 2>/dev/null | head -n 1)"
+          fi
+          echo "sdkmanager => $SDKMGR"
+          test -n "$SDKMGR"
+
+          yes | "$SDKMGR" --licenses >/dev/null 2>&1 || true
+          "$SDKMGR" "platform-tools" "platforms;android-34" "build-tools;34.0.0" || true
+
+          echo "--- installed platforms ---"
+          ls "$ANDROID_HOME/platforms" 2>/dev/null || true
+          echo "--- installed build-tools ---"
+          ls "$ANDROID_HOME/build-tools" 2>/dev/null || true
 
       - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@v3
+        uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.5'
 
