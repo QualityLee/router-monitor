@@ -98,8 +98,12 @@ class RouterClient(hostInput: String, private val password: String) {
     private val pages = LinkedHashMap<String, String>()
     private val postLog = ArrayList<String>()
 
-    /** 真正的首页。GET / 可能只是个 JS 跳转壳（G805 就是），要跟到最终页面 */
-    private var homeUrl: String = baseUrl + "/"
+    /**
+     * 真正的首页。GET / 可能只是个 JS 跳转壳（G805 就是），要跟到最终页面。
+     * 注意：不能写成 `= baseUrl + "/"` —— baseUrl 要到下面的 init 块里才赋值，
+     * 属性初始化器的执行顺序在 init 块之前，那样拿到的是空值。所以在 init 里赋值。
+     */
+    private var homeUrl: String = ""
 
     /** 页面里没有 <form>、字段全靠 data-bind 渲染 → JS 单页应用，静态 HTML 抓不到值 */
     var spaDetected = false
@@ -112,6 +116,7 @@ class RouterClient(hostInput: String, private val password: String) {
         if (h.isEmpty()) h = "192.168.1.1"
         host = h.substringBefore('/')
         baseUrl = "http://$host"
+        homeUrl = "$baseUrl/"
     }
 
     private val client: OkHttpClient = OkHttpClient.Builder()
