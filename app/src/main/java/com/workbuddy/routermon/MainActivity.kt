@@ -111,7 +111,9 @@ class MainActivity : AppCompatActivity() {
                     } else {
                         log("未取到数据。若上面提示 SPA 固件，请点【网页模式(推荐)】")
                     }
+                    // 诊断报告三段：常规日志 → 业务 JS 源码（接口说明书）→ 页面原始响应
                     sb.append(c.diagText())
+                    sb.append('\n').append(c.jsDump())
                     sb.append("\n===== 抓到的原始响应 =====\n")
                     sb.append(c.pagesDump())
                 } catch (e: Exception) {
@@ -152,7 +154,8 @@ class MainActivity : AppCompatActivity() {
                         withContext(Dispatchers.Main) { renderInfo(info) }
                     }
                     client = c
-                    lastDiag = c.diagText() + "\n===== 原始响应 =====\n" + c.pagesDump()
+                    lastDiag = c.diagText() + "\n" + c.jsDump() +
+                        "\n===== 原始响应 =====\n" + c.pagesDump()
                     Pair(r.ok, r.message)
                 } catch (e: Exception) {
                     lastDiag = c.diagText()

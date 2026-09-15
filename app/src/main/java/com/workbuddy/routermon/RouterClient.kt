@@ -88,6 +88,49 @@ class RouterClient(hostInput: String, private val password: String) {
 
         private const val MAX_PAGES = 26
         private const val MAX_CORPUS = 400_000
+
+        /**
+         * 第三方库文件名特征。G805 首页引用了 30 个 JS，其中一大半是
+         * jquery / knockout / underscore / require / bootstrap —— 里面只有框架代码，
+         * 不可能有后端接口。跳过它们，把抓取配额留给真正的业务 JS。
+         */
+        private val JS_LIB_MARKS = listOf(
+            "/lib/", "require", "jquery.", "bootstrap", "underscore", "knockout",
+            "html5shiv", "respond.min", "base64"
+        )
+
+        /**
+         * 名字里带这些词的业务 JS 最可能定义接口，优先抓。
+         * 依据：G805 引用了 js/service.js、js/config/config.js、js/login.js、
+         * js/status/statusBar.js、js/main.js、js/app.js —— 接口地址就在这几份里。
+         */
+        private val JS_HOT = listOf(
+            "service", "config", "login", "main", "app", "status",
+            "router", "util", "language", "logout", "tooltip", "menu"
+        )
+
+        private const val MAX_JS_FETCH = 16
+
+        /**
+         * 接口名里有这些词 → 只读接口，做探测性 POST 是安全的。
+         *
+         * 为什么要这个白名单：从 JS 里挖出来的接口是**未经审核**的，路由器上同时存在
+         * /cgi-bin/wifi_set、/cgi-bin/reboot 这类**写**接口，盲打可能改坏用户的路由器配置。
+         * 所以只允许对明确像"读"的接口做 POST 探测。
+         */
+        private val READONLY_MARKS = listOf(
+            "status", "get", "info", "query", "list", "home", "state", "read",
+            "overview", "detail", "stats", "statistic", "signal", "sim", "show",
+            "load", "fetch", "check", "version", "traffic", "device", "network"
+        )
+
+        /** 接口名里有这些词 → 写操作，绝不做探测性请求 */
+        private val WRITE_MARKS = listOf(
+            "set", "save", "edit", "del", "remove", "reboot", "restart", "reset",
+            "apply", "write", "update", "upgrade", "upload", "config", "submit",
+            "add", "create", "modify", "change", "factory", "restore", "clear",
+            "dial", "connect", "disconnect", "auth", "sms", "pin"
+        )
     }
 
     val host: String
@@ -97,6 +140,9 @@ class RouterClient(hostInput: String, private val password: String) {
     private val cookies = LinkedHashMap<String, Cookie>()
     private val pages = LinkedHashMap<String, String>()
     private val postLog = ArrayList<String>()
+
+    /** 成功抓到的业务 JS URL（按抓取顺序），供 jsDump() 单独输出 */
+    private val jsUrls = ArrayList<String>()
 
     /**
      * 真正的首页。GET / 可能只是个 JS 跳转壳（G805 就是），要跟到最终页面。
@@ -416,7 +462,15 @@ class RouterClient(hostInput: String, private val password: String) {
         // SPA 固件的接口藏在页面引用的 JS 里，先挖出来再挨个试
         val mined = mineEndpoints()
 
-        val guesses = ArrayList<String>(mined)
+        // 安全闸：挖出来的接口是未审核的，像写操作的绝不能拿来 POST（可能改坏路由器配置）
+        val guesses = ArrayList<String>()
+        for (m in mined) {
+            if (isWriteEndpoint(m)) {
+                slog("  跳过写接口 $m（不用于登录尝试）")
+                continue
+            }
+            guesses.add(m)
+        }
         guesses.addAll(listOf(
             "/login.cgi", "/cgi-bin/login.cgi", "/login", "/goform/login",
             "/cgi-bin/login", "/login.html", "/index.cgi", "/goform/Login"
@@ -838,14 +892,8 @@ class RouterClient(hostInput: String, private val password: String) {
         return n
     }
 
-    /**
-     * 抓取页面引用的所有 JS，并从中挖出后端接口。
-     *
-     * SPA 固件（USR-G805 新 webui 就是）的数据全走 AJAX，静态 HTML 里一个值都没有，
-     * JS 就成了唯一能拿到接口清单的地方。抓到的 JS 会存进 pages，
-     * 于是会自动出现在诊断报告的「抓到的原始响应」里。
-     */
-    fun mineEndpoints(): List<String> {
+    /** 收集页面里引用的同源 JS 地址（全部，含第三方库） */
+    private fun collectScripts(): List<String> {
         val scripts = LinkedHashSet<String>()
         for ((pageUrl, body) in pages) {
             if (body.isBlank() || pageUrl.startsWith("POST ")) continue
@@ -858,15 +906,55 @@ class RouterClient(hostInput: String, private val password: String) {
             } catch (_: Exception) {
             }
         }
+        return scripts.toList()
+    }
+
+    /**
+     * 这个接口像不像「写操作」？像的就绝不做探测性请求。
+     *
+     * 从 JS 里挖出来的接口是未经审核的，路由器上同时有 /cgi-bin/wifi_set、
+     * /cgi-bin/reboot 这类写接口 —— 盲打可能直接改坏用户的路由器配置。
+     * 所以探测前必须过这一关：只允许明显「读」的接口。
+     */
+    private fun isWriteEndpoint(u: String): Boolean {
+        val low = u.lowercase()
+        // 明显是读的，优先放行（"get_status" 里既有 get 又有 status，别被 write 规则误伤）
+        if (READONLY_MARKS.any { low.contains(it) } &&
+            !low.contains("_set") && !low.contains("/set") && !low.contains("save")
+        ) return false
+        return WRITE_MARKS.any { low.contains(it) }
+    }
+
+    /**
+     * 抓取页面引用的 JS 并从中挖出后端接口。
+     *
+     * USR-G805 新 webui 是 RequireJS + Knockout 单页应用：静态 HTML 里一个数据都没有，
+     * 接口地址全写在 js/service.js、js/config/config.js、js/login.js 这些**业务 JS** 里。
+     * 关键认识（来自 2026-09-15 的网页模式日志）：这些 JS 都是**静态文件、不需要登录**，
+     * 所以哪怕登录没成，也能先把它们拉下来，把接口清单完整挖出来。
+     *
+     * 抓到的 JS 正文存进 pages，再由 jsDump() 单独成段输出到报告。
+     */
+    fun mineEndpoints(): List<String> {
+        val scripts = collectScripts()
         if (scripts.isEmpty()) {
             slog("页面里没有引用同源 JS 文件，无法从 JS 挖接口")
             return emptyList()
         }
 
+        // 真机实测首页引用 30 个 JS，其中大部分是框架。只抓业务 JS，配额留给真正有用的。
+        val appJs = scripts.filter { s -> JS_LIB_MARKS.none { s.lowercase().contains(it) } }
+        val ordered = appJs.sortedByDescending { s ->
+            val hit = JS_HOT.indexOfFirst { s.lowercase().contains(it) }
+            if (hit < 0) 0 else JS_HOT.size - hit
+        }
+        slog("页面引用 ${scripts.size} 个 JS，其中业务 JS ${appJs.size} 个：")
+        for (s in ordered) slog("    ${JS_HOT.firstOrNull { s.lowercase().contains(it) } ?: "-"}  $s")
+
         val texts = StringBuilder()
         var n = 0
-        for (s in scripts) {
-            if (n >= 10) break
+        for (s in ordered) {
+            if (n >= MAX_JS_FETCH) break
             n++
             if (pages.containsKey(s)) {
                 texts.append(pages[s]).append('\n')
@@ -876,8 +964,9 @@ class RouterClient(hostInput: String, private val password: String) {
                 val r = get(s)
                 if (r.code == 200 && r.body.isNotBlank()) {
                     pages[s] = r.body
+                    jsUrls.add(s)
                     texts.append(r.body).append('\n')
-                    slog("GET $s → ${r.code}, ${r.body.length} 字节")
+                    slog("GET $s → ${r.code}, ${r.body.length} 字节 ✓ 已存入报告")
                 } else {
                     slog("GET $s → ${r.code}, ${r.body.length} 字节")
                 }
@@ -891,7 +980,11 @@ class RouterClient(hostInput: String, private val password: String) {
             Regex("""["'](/cgi-bin/[A-Za-z0-9_\-/\.]{1,70}?\.(?:cgi|json|xml|asp|do|txt))["']"""),
             Regex("""["'](/goform/[A-Za-z0-9_\-]{2,40})["']"""),
             Regex("""["'](/(?:cgi-bin|cgi|api|webui|action)/[A-Za-z0-9_\-/\.]{1,70})["']"""),
-            Regex("""(?:url|action|path)\s*[:=]\s*["'](/?[A-Za-z0-9_\-/\.]{2,70}\.(?:cgi|json|xml|do))["']""")
+            Regex("""(?:url|action|path)\s*[:=]\s*["'](/?[A-Za-z0-9_\-/\.]{2,70}\.(?:cgi|json|xml|do))["']"""),
+            // G805 这类把接口写成 "xxx.cgi"（不带前导斜杠）的写法
+            Regex("""["']([A-Za-z0-9_\-]{2,40}\.cgi(?:\?[A-Za-z0-9_\-=&%\.]{0,40})?)["']"""),
+            // $.post / $.get / $.ajax 的第一个参数
+            Regex("""\$\.(?:post|get|ajax)\s*\(\s*["']([^"']{2,80})["']""")
         )
         for (p in patterns) {
             try {
@@ -905,12 +998,48 @@ class RouterClient(hostInput: String, private val password: String) {
                     !u.lowercase().endsWith(".ico") && !u.lowercase().endsWith(".js") &&
                     !SKIP_WORDS.any { u.lowercase().contains(it) }
         }
-        if (list.isEmpty()) {
-            slog("看了 ${scripts.size} 个 JS，没挖到 /cgi-bin 之类的接口路径")
-        } else {
-            slog("★ 从 JS 挖到候选接口 ${list.size} 个：" + list.take(12).joinToString(", "))
+
+        // 没有前导斜杠的 .cgi 补一个 /cgi-bin/ 版本（G805 的接口目录就是 /cgi-bin/）
+        val norm = LinkedHashSet<String>()
+        for (u in list) {
+            norm.add(u)
+            if (!u.startsWith("/") && u.lowercase().contains(".cgi")) norm.add("/cgi-bin/" + u)
         }
-        return list.toList()
+
+        if (norm.isEmpty()) {
+            slog("看了 ${n} 个业务 JS，没挖到 /cgi-bin 之类的接口路径")
+        } else {
+            val readable = norm.filter { !isWriteEndpoint(it) }
+            slog("★ 从 JS 挖到候选接口 ${norm.size} 个（其中看似只读、可安全探测的 ${readable.size} 个）：")
+            slog("    只读: " + readable.take(16).joinToString(", "))
+            val writes = norm.filter { isWriteEndpoint(it) }
+            if (writes.isNotEmpty()) slog("    写操作（不探测）: " + writes.take(8).joinToString(", "))
+        }
+        return norm.toList()
+    }
+
+    /**
+     * 业务 JS 源码单独成段输出。
+     *
+     * 这是本轮最重要的新增：G805 的接口地址、参数名、返回结构全写在这些 JS 里，
+     * 而它们都是静态文件、**不需要登录**就能取到 —— 拿到它们等于拿到了接口说明书。
+     * 只输出业务 JS（跳过 jquery / knockout 这些框架），每份截 maxPer。
+     */
+    fun jsDump(maxPer: Int = 25000, maxFiles: Int = 12): String {
+        val picked = jsUrls.filter { pages.containsKey(it) }
+        if (picked.isEmpty()) return ""
+        val sb = StringBuilder()
+        sb.append("\n\n===== 业务 JS 源码（后端接口地址就写在里面）=====\n")
+        var n = 0
+        for (u in picked) {
+            if (n >= maxFiles) break
+            n++
+            val b = pages[u] ?: continue
+            sb.append("\n----- ").append(u).append("  (长度 ").append(b.length).append(") -----\n")
+            sb.append(if (b.length > maxPer) b.substring(0, maxPer) + "\n...[已截断]" else b)
+            sb.append('\n')
+        }
+        return sb.toString()
     }
 
     /**
@@ -927,7 +1056,14 @@ class RouterClient(hostInput: String, private val password: String) {
             "username=admin&password=" + enc(password)
         )
         var hits = 0
+        var skipped = 0
         for (c in CGI_CANDIDATES) {
+            // 安全闸：像写操作的接口一律不碰，避免改坏路由器配置
+            if (isWriteEndpoint(c)) {
+                skipped++
+                slog("  跳过 $c（名字像写操作，不做探测性 POST）")
+                continue
+            }
             for (b in bodies) {
                 val r = try {
                     post(c, b, homeUrl)
@@ -946,7 +1082,7 @@ class RouterClient(hostInput: String, private val password: String) {
                 }
             }
         }
-        if (hits == 0) slog("  这批接口都没给出有效响应（都返回了错误页）")
-        else slog("  有 $hits 个接口给出了非错误响应，已记入下方「POST 提交/响应」")
+        if (hits == 0) slog("  这批接口都没给出有效响应（都返回了错误页），跳过写接口 $skipped 个")
+        else slog("  有 $hits 个接口给出了非错误响应，已记入下方「POST 提交/响应」；跳过写接口 $skipped 个")
     }
 }
