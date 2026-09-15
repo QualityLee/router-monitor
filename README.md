@@ -149,3 +149,54 @@ android-router-monitor/
             ├── values/strings.xml
             └── xml/network_security_config.xml
 ```
+
+---
+
+## ☁️ 已用 GitHub Actions 成功编译（推荐路径）
+
+因为本机安全策略封了 Java 进程间的 loopback TCP，Gradle 无法在本地运行。
+工程已推送到 https://github.com/QualityLee/router-monitor ，云端编译已跑通。
+
+产物（本地副本）：`outputs/RouterMonitor-debug.apk`（7.1 MB，minSdk 21，兼容 Android 5.1）
+
+### 重新编译
+1. 打开 https://github.com/QualityLee/router-monitor/actions
+2. 左侧选 **Build Debug APK** → **Run workflow** → 选 main → 绿色按钮
+3. 约 3 分钟完成，在 run 页面底部 **Artifacts** 下载 `app-debug.zip`
+
+### 踩过的坑（已在仓库中修好）
+- `android-actions/setup-android@v3` 已失效（内部执行 `sdkmanager tools`，该包已从 Google 仓库下架），
+  现改为直接用 runner 镜像自带的 SDK + `sdkmanager` 装 `platforms;android-34` / `build-tools;34.0.0`。
+- `gradle/actions/setup-gradle@v4` 指定 Gradle 8.5，与 AGP 8.2.2 / Kotlin 1.9.22 匹配。
+
+### 安装到工控机（Android 5.1）
+```cmd
+adb install -r RouterMonitor-debug.apk
+```
+工控机若无法连 USB，把 APK 拷到 U 盘，用文件管理器安装（需开启「未知来源」）。
+
+
+---
+
+## ☁️ 已用 GitHub Actions 成功编译（推荐路径）
+
+因为本机安全策略封了 Java 进程间的 loopback TCP，Gradle 无法在本地运行。
+工程已推送到 https://github.com/QualityLee/router-monitor ，云端编译已跑通。
+
+产物（本地副本）：`outputs/RouterMonitor-debug.apk`（7.1 MB，minSdk 21，兼容 Android 5.1）
+
+### 重新编译
+1. 打开 https://github.com/QualityLee/router-monitor/actions
+2. 左侧选 **Build Debug APK** → **Run workflow** → 选 main → 绿色按钮
+3. 约 3 分钟完成，在 run 页面底部 **Artifacts** 下载 `app-debug.zip`
+
+### 踩过的坑（已在仓库中修好）
+- `android-actions/setup-android@v3` 已失效（内部执行 `sdkmanager tools`，该包已从 Google 仓库下架），
+  现改为直接用 runner 镜像自带的 SDK + `sdkmanager` 装 `platforms;android-34` / `build-tools;34.0.0`。
+- `gradle/actions/setup-gradle@v4` 指定 Gradle 8.5，与 AGP 8.2.2 / Kotlin 1.9.22 匹配。
+
+### 安装到工控机（Android 5.1）
+```cmd
+adb install -r RouterMonitor-debug.apk
+```
+工控机若无法连 USB，把 APK 拷到 U 盘，用文件管理器安装（需开启「未知来源」）。
