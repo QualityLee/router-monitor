@@ -3,13 +3,25 @@
     <string name="app_name">4G路由器监控</string>
     <string name="hint_router_ip">路由器 LAN IP(USR-G805 默认 192.168.1.1)</string>
     <string name="hint_password">登录密码(USR-G805 默认 admin)</string>
-    <string name="btn_login">登录并获取信息</string>
+
+    <string name="btn_diag">① 诊断自检</string>
+    <string name="btn_login">② 登录并获取</string>
     <string name="btn_refresh">刷新</string>
     <string name="btn_logout">退出</string>
+    <string name="btn_web">网页模式</string>
+    <string name="btn_copy">复制诊断</string>
+    <string name="btn_save">保存日志</string>
+    <string name="btn_clear">清空</string>
+    <string name="btn_wv_reload">重新打开</string>
+    <string name="btn_wv_grab">抓取本页数据</string>
+
+    <string name="label_live">实时信息</string>
+    <string name="label_log">诊断日志（可选中复制；登录失败时把这里的内容发我）</string>
     <string name="label_iccid">SIM 卡卡号 (ICCID)</string>
     <string name="label_imei">IMEI</string>
     <string name="label_imsi">IMSI</string>
     <string name="label_rssi">信号强度</string>
+    <string name="label_rsrp">RSRP</string>
     <string name="label_network">网络制式</string>
     <string name="label_operator">运营商</string>
     <string name="label_run_time">运行时间</string>
