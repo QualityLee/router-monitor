@@ -258,6 +258,13 @@ object HtmlParser {
         return ALL_LABELS.any { it == t }
     }
 
+    /** 出现这些片段的「值」其实是 CSS / JS 残渣，不是数据 */
+    private val JUNK_MARKS = listOf(
+        "{", "}", ";", "=>", "function", "document.", "window.", "style=",
+        "px;", "px ", "var(", "javascript:", "display:", "position:", "@media",
+        "data-bind", "data-trans", "http-equiv"
+    )
+
     private fun clean(v: String?): String? {
         if (v == null) return null
         var s = decode(v).trim()
@@ -267,6 +274,14 @@ object HtmlParser {
         if (s.isEmpty() || s.length > 60) return null
         if (isLabelOnly(s)) return null
         if (s == "--" || s == "-") return null
+        // 过滤假值。真实场景：页面属性 style="display: none; position: relative;">
+        // 被当成「运营商」的值取了出来。（见 2026-09-15 真机诊断日志）
+        val low = s.lowercase()
+        for (j in JUNK_MARKS) if (low.contains(j)) return null
+        if (s.endsWith(">") || s.endsWith("\"") || s.endsWith("'") || s.endsWith("=")) return null
+        if (s.count { it == ' ' } >= 8) return null
+        // 两个以上冒号通常是 JS 片段（a?b:c:d），但 "14:30:00" 这种时间要放行
+        if (s.count { it == ':' } >= 2 && !Regex("""^\d{1,2}:\d{2}(:\d{2})?$""").matches(s)) return null
         return s
     }
 }

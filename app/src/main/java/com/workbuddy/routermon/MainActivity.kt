@@ -36,6 +36,7 @@ class MainActivity : AppCompatActivity() {
     private var pollJob: Job? = null
     private var lastDiag = ""
     private var busy = false
+    private var lastWebInfo: SignalInfo? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -52,8 +53,19 @@ class MainActivity : AppCompatActivity() {
         binding.btnClear.setOnClickListener { clearLog() }
 
         log("就绪。目标 http://${ip()}\n" +
-                "点【① 诊断自检】可打印完整过程；\n" +
-                "点【网页模式】可直接打开路由器后台页面。")
+                "先点【① 诊断自检】看链路；\n" +
+                "若提示是 SPA 固件，请点【网页模式(推荐)】。")
+    }
+
+    override fun onResume() {
+        super.onResume()
+        // 网页模式抓到的结果带回主界面
+        val info = WebViewActivity.lastInfo
+        if (info != null && info.hasData() && info !== lastWebInfo) {
+            lastWebInfo = info
+            renderInfo(info)
+            log("已接收网页模式的结果 ${info.summary()}")
+        }
     }
 
     override fun onDestroy() {
@@ -94,7 +106,11 @@ class MainActivity : AppCompatActivity() {
                     // 不管登录成不成功都抓一遍：成功就能取到数据；
                     // 失败也能把页面清单 / JS 里的接口挖出来，便于定位真正的登录接口
                     val info = c.fetchSignalInfo()
-                    if (info.hasData()) withContext(Dispatchers.Main) { renderInfo(info) }
+                    if (info.hasData()) {
+                        withContext(Dispatchers.Main) { renderInfo(info) }
+                    } else {
+                        log("未取到数据。若上面提示 SPA 固件，请点【网页模式(推荐)】")
+                    }
                     sb.append(c.diagText())
                     sb.append("\n===== 抓到的原始响应 =====\n")
                     sb.append(c.pagesDump())
@@ -151,7 +167,7 @@ class MainActivity : AppCompatActivity() {
                 startPolling()
             } else {
                 log("登录失败 ✗ ${res.second}")
-                toast("登录未通过，请点「诊断自检」后把日志发我")
+                toast("登录未通过，请点【网页模式(推荐)】或【① 诊断自检】")
             }
         }
     }

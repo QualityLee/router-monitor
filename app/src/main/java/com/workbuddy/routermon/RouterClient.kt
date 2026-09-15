@@ -20,11 +20,12 @@ import java.util.concurrent.TimeUnit
  *
  * 设计思路：绝大多数路由器 webUI 的登录都是「打开首页 -> 表单 POST -> 跳转到内页」，
  * 所以这里不写死接口：
- *   1. 先 GET / 拿到登录页，用 Jsoup 自动发现 <form> 的 action / method / 字段名
- *   2. 用发现的字段名构造 POST（密码框填密码，用户/账号框填 admin，隐藏域原样带回）
- *   3. 若首页没有表单，再退回到一批常见 CGI 接口逐一尝试
- *   4. 登录是否成功不靠 Set-Cookie 名字判断，而是「再 GET 首页，看是不是还是登录页」
- *   5. 抓数据时按 BFS 爬取同源页面（含 frame/iframe）+ JS 里的接口，再通用解析
+ *   1. GET / 并**跟随跳转壳**（USR-G805 的 / 只返回 window.location.href="index.html"）
+ *   2. 用 Jsoup 自动发现最终首页里 <form> 的 action / method / 字段名
+ *   3. 页面里没有表单时，抓取它引用的 JS，从里面挖 /cgi-bin/*.cgi 之类的接口再逐个试
+ *   4. 登录是否成功不靠 Set-Cookie 名字判断，而是「POST 返回的 JSON + 复检首页」
+ *   5. 若首页是 JS 单页应用（G805 新 webui 就是），静态 HTML 里没有数据，
+ *      会额外对 /cgi-bin 接口做 POST 探测，并把结论指向「网页模式」
  */
 class RouterClient(hostInput: String, private val password: String) {
 
@@ -54,8 +55,35 @@ class RouterClient(hostInput: String, private val password: String) {
 
         private val SEED_PATHS = listOf(
             "/", "/index.html", "/home.html", "/overview.html", "/status.html", "/state.html",
-            "/main.html", "/network.html", "/info.html",
+            "/main.html", "/network.html", "/info.html", "/device.html", "/sim.html",
             "/status.cgi", "/overview.cgi", "/cgi-bin/status.cgi", "/goform/status"
+        )
+
+        /**
+         * USR-G805 真机实测（2026-09-15 诊断日志）：
+         *   GET /cgi-bin/status.cgi → HTTP 200 + "Access Error: Data follows / NOT POST REQUEST"
+         * 也就是这个接口**存在，而且只接受 POST**。SPA 的数据接口就在 /cgi-bin/ 下，
+         * 这几个是最常见的命名，登录失败时会逐个 POST 探一遍并把响应写进报告。
+         */
+        private val CGI_CANDIDATES = listOf(
+            "/cgi-bin/status.cgi", "/cgi-bin/status", "/cgi-bin/home.cgi",
+            "/cgi-bin/baseinfo.cgi", "/cgi-bin/system.cgi",
+            "/cgi-bin/network.cgi", "/cgi-bin/sim.cgi", "/cgi-bin/wireless.cgi",
+            "/cgi-bin/signal.cgi", "/cgi-bin/info.cgi", "/cgi-bin/data.cgi",
+            "/cgi-bin/login.cgi", "/cgi-bin/webui.cgi"
+        )
+
+        /** 登录接口返回 JSON 时，这些片段代表成功 */
+        private val JSON_OK = listOf(
+            "\"ret\":0", "\"ret\": 0", "\"code\":0", "\"code\": 0", "\"result\":0",
+            "\"success\":true", "\"success\": true", "\"status\":0",
+            "success", "ok", "true"
+        )
+
+        /** …这些代表失败 */
+        private val JSON_FAIL = listOf(
+            "\"ret\":1", "\"ret\":-1", "\"code\":-1", "\"code\":1", "\"success\":false",
+            "\"success\": false", "\"result\":1", "password error", "login failed", "invalid"
         )
 
         private const val MAX_PAGES = 26
@@ -69,6 +97,13 @@ class RouterClient(hostInput: String, private val password: String) {
     private val cookies = LinkedHashMap<String, Cookie>()
     private val pages = LinkedHashMap<String, String>()
     private val postLog = ArrayList<String>()
+
+    /** 真正的首页。GET / 可能只是个 JS 跳转壳（G805 就是），要跟到最终页面 */
+    private var homeUrl: String = baseUrl + "/"
+
+    /** 页面里没有 <form>、字段全靠 data-bind 渲染 → JS 单页应用，静态 HTML 抓不到值 */
+    var spaDetected = false
+        private set
 
     init {
         var h = hostInput.trim()
@@ -117,7 +152,7 @@ class RouterClient(hostInput: String, private val password: String) {
             sb.append('\n')
         }
         for (p in postLog) {
-            sb.append("\n===== 登录提交/响应 =====\n").append(p).append('\n')
+            sb.append("\n===== POST 提交/响应 =====\n").append(p).append('\n')
         }
         return sb.toString()
     }
@@ -235,11 +270,10 @@ class RouterClient(hostInput: String, private val password: String) {
         return r
     }
 
-    /** GET / 探测，返回一行概览并落日志 */
+    /** GET / 探测，返回一行概览并落日志（会跟随跳转壳） */
     fun probeHome(): String {
         return try {
-            val r = get("/")
-            pages["/"] = r.body
+            val r = loadHome()
             val title = runCatching {
                 val t = Jsoup.parse(r.body).title()
                 if (t.isBlank()) "" else " 标题=$t"
@@ -248,16 +282,81 @@ class RouterClient(hostInput: String, private val password: String) {
                     (r.location?.let { ", Location=$it" } ?: "") +
                     (if (r.setCookie.isNotBlank()) ", Set-Cookie=${r.setCookie.take(100)}" else "") +
                     (if (r.authenticate.isNotBlank()) ", WWW-Authenticate=${r.authenticate.take(80)}" else "")
-            slog("【首页探测】GET / → $msg")
+            slog("【首页探测】GET $homeUrl → $msg")
             val text = HtmlParser.toLines(r.body).replace('\n', ' ').take(180)
             slog("  页面文字: $text")
             if (isLoginPage(r.body)) slog("  → 判定：这是登录页")
-            else if (looksLoggedIn(r.body)) slog("  → 判定：当前已经是登录状态（无需再登录）")
+            else if (looksLoggedIn(r.body)) slog("  → 判定：页面已是后台结构（是否真登录见下方「SPA」提示）")
             msg
         } catch (e: Exception) {
             val msg = "GET / 失败：${e.javaClass.simpleName}: ${e.message}"
             slog("【首页探测】$msg")
             msg
+        }
+    }
+
+    /**
+     * GET / 并一路跟随跳转，直到拿到真正的页面。
+     *
+     * USR-G805 真机实测：GET / 只返回 168 字节的壳 ——
+     *     <script>window.location.href="index.html";</script>
+     * 真正的后台页在 /index.html（14442 字节的 Knockout.js 单页应用）。
+     * 不跟这一步，后面「找登录表单 / 判登录态 / 解析字段」全会错位。
+     */
+    private fun loadHome(): Resp {
+        var path = "/"
+        var r = get(path)
+        pages[path] = r.body
+        var hop = 0
+        while (hop < 3) {
+            val target = redirectTarget(r) ?: break
+            hop++
+            val next = if (target.startsWith("http")) target else "/" + target.trimStart('/')
+            val nr = try {
+                get(next)
+            } catch (e: Exception) {
+                slog("  跟随 $next 失败: ${e.message}")
+                break
+            }
+            slog("  首页只是跳转壳 → 跟随 $next （HTTP ${nr.code}, ${nr.body.length} 字节）")
+            path = next
+            r = nr
+            pages[path] = r.body
+        }
+        homeUrl = abs(path)
+        if (homeUrl != baseUrl + "/") slog("  → 实际首页: $homeUrl")
+        detectSpa(r.body)
+        return r
+    }
+
+    /** 识别跳转目标：HTTP 3xx 的 Location / JS 的 location.href / meta refresh */
+    private fun redirectTarget(r: Resp): String? {
+        if (r.code in 300..399 && !r.location.isNullOrBlank()) {
+            val loc = r.location!!.trim()
+            return if (loc.startsWith("http")) loc else "/" + loc.trimStart('/')
+        }
+        if (r.body.isBlank() || r.body.length > 3000) return null
+        Regex("""(?i)location\s*\.\s*(?:href|replace|assign)\s*(?:\(\s*)?=?\s*["']([^"']{1,140})["']""")
+            .find(r.body)?.let {
+                val v = it.groupValues[1].trim()
+                if (v.isNotEmpty() && !v.startsWith("javascript")) return v
+            }
+        Regex("""(?is)<meta[^>]+http-equiv\s*=\s*["']?refresh["']?[^>]*content\s*=\s*["'][^"']*url\s*=\s*([^"';>\s]+)""")
+            .find(r.body)?.let { return it.groupValues[1].trim() }
+        return null
+    }
+
+    /** 判断是不是 JS 单页应用：没有 <form>，字段全靠 data-bind 渲染出来 */
+    private fun detectSpa(html: String) {
+        if (html.isBlank() || spaDetected) return
+        val low = html.lowercase()
+        val binds = Regex("data-bind\\s*=").findAll(low).count()
+        if (!low.contains("<form") &&
+            (binds >= 3 || low.contains("knockout") || low.contains("jquery.js"))
+        ) {
+            spaDetected = true
+            slog("  ⚠ 检测到 JS 单页应用：没有 <form>，$binds 处 data-bind，值由 JS 运行时填充")
+            slog("     → 静态 HTML 里没有信号/ICCID 的值，必须走「从 JS 挖接口」或「网页模式」")
         }
     }
 
@@ -271,25 +370,28 @@ class RouterClient(hostInput: String, private val password: String) {
         slog("——— 开始登录 $baseUrl ———")
 
         val home: Resp = try {
-            get("/")
+            loadHome()
         } catch (e: Exception) {
             val m = "无法连接 $baseUrl/ ：${e.javaClass.simpleName} ${e.message}"
             slog(m)
             return LoginOutcome(false, m)
         }
-        pages["/"] = home.body
-        slog("GET / → HTTP ${home.code}, 长度 ${home.body.length}")
+        slog("GET $homeUrl → HTTP ${home.code}, 长度 ${home.body.length}")
         if (home.authenticate.isNotBlank()) slog("WWW-Authenticate: ${home.authenticate}")
-
-        // 已经登录过了？
-        if (looksLoggedIn(home.body)) {
-            slog("首页看起来已经是后台页面，直接跳过登录")
-            return LoginOutcome(true, "已处于登录状态")
-        }
 
         // 401：固件用的是 HTTP 授权（浏览器会弹原生登录框），而不是页面表单
         if (home.code == 401 || home.authenticate.isNotBlank()) {
             if (tryHttpAuth(home.authenticate)) return LoginOutcome(true, "HTTP 授权登录成功")
+        }
+
+        // 已经登录过了？注意 SPA 固件的首页在「未登录」时也长得像后台，
+        // 所以这里只是跳过登录流程，真正的判定交给抓数据那一步。
+        if (looksLoggedIn(home.body)) {
+            slog("首页结构看起来已经是后台页面")
+            return if (spaDetected)
+                LoginOutcome(true, "SPA 固件：无法用纯 HTML 判断登录态，直接进入抓取（推荐用「网页模式」）")
+            else
+                LoginOutcome(true, "已处于登录状态")
         }
 
         val form = findLoginForm(home.body)
@@ -299,17 +401,21 @@ class RouterClient(hostInput: String, private val password: String) {
             slog("自动发现登录表单：action=${form.action} method=${form.method} 字段=${form.fields.keys.joinToString(",")}")
             for (b in buildBodies(form)) {
                 attempts++
-                val r = tryPost(form.action, b, form.method, "/") ?: continue
+                val r = tryPost(form.action, b, form.method, homeUrl) ?: continue
                 if (accepted(r, b)) return LoginOutcome(true, "表单登录成功：${form.action}")
             }
         } else {
             slog("首页未发现 <form> 或密码框，改用内置候选接口")
         }
 
-        val guesses = listOf(
+        // SPA 固件的接口藏在页面引用的 JS 里，先挖出来再挨个试
+        val mined = mineEndpoints()
+
+        val guesses = ArrayList<String>(mined)
+        guesses.addAll(listOf(
             "/login.cgi", "/cgi-bin/login.cgi", "/login", "/goform/login",
             "/cgi-bin/login", "/login.html", "/index.cgi", "/goform/Login"
-        )
+        ))
         val bodies = listOf(
             "password=" + enc(password),
             "username=admin&password=" + enc(password),
@@ -319,7 +425,7 @@ class RouterClient(hostInput: String, private val password: String) {
         for (g in guesses) {
             for (b in bodies) {
                 attempts++
-                val r = tryPost(g, b, "post", "/") ?: continue
+                val r = tryPost(g, b, "post", homeUrl) ?: continue
                 if (accepted(r, b)) return LoginOutcome(true, "候选接口登录成功：$g")
             }
         }
@@ -359,11 +465,11 @@ class RouterClient(hostInput: String, private val password: String) {
         return false
     }
 
-    /** 登录失败时把登录页 HTML 与表单结构原样记进日志，诊断报告里就能看到真实表单 */
+    /** 登录失败时把登录页 HTML 与表单/脚本结构原样记进日志 */
     private fun logLoginPageSnapshot() {
-        val h = pages["/"] ?: return
+        val h = pages[homeUrl] ?: pages["/"] ?: return
         if (h.isBlank()) return
-        slog("——— 登录页原始 HTML（前 2500 字符）———")
+        slog("——— 登录页原始 HTML（$homeUrl，前 2500 字符）———")
         slog(h.take(2500))
         try {
             val doc = Jsoup.parse(h, baseUrl + "/")
@@ -375,13 +481,16 @@ class RouterClient(hostInput: String, private val password: String) {
                 }
                 slog("  <form action=${f.attr("action")} method=${f.attr("method")}> $fields")
             }
+            val pws = doc.select("input[type=password]")
+            if (pws.isNotEmpty()) {
+                slog("——— 密码输入框 ${pws.size} 个 ———")
+                for (p in pws) {
+                    slog("  input#${p.attr("id")} name=${p.attr("name")} class=${p.attr("class")} " +
+                            "所在表单=${if (p.form() == null) "无（靠 JS 提交）" else p.form()!!.attr("action")}")
+                }
+            }
             val scripts = doc.select("script[src]").joinToString(", ") { it.attr("src") }
             if (scripts.isNotBlank()) slog("  引用的 JS: $scripts")
-            val inlineJs = doc.select("script:not([src])").joinToString(" ") { it.data() }
-            if (inlineJs.contains("password", true) && inlineJs.length < 4000) {
-                slog("——— 页面内联 JS（含 password）———")
-                slog(inlineJs.take(2500))
-            }
         } catch (e: Exception) {
             slog("  解析登录页结构失败: ${e.message}")
         }
@@ -408,7 +517,7 @@ class RouterClient(hostInput: String, private val password: String) {
                         (r.location?.let { "  Location=$it" } ?: "") +
                         "\n" + r.body.take(6000)
             )
-            while (postLog.size > 3) postLog.removeAt(0)
+            while (postLog.size > 14) postLog.removeAt(0)
             r
         } catch (e: Exception) {
             slog("  POST $url 失败：${e.javaClass.simpleName} ${e.message}")
@@ -416,7 +525,7 @@ class RouterClient(hostInput: String, private val password: String) {
         }
     }
 
-    /** 判断这次登录是否真的成功了：再看一眼首页是不是还是登录页 */
+    /** 判断这次登录是否真的成功了 */
     private fun accepted(r: Resp, bodySent: String): Boolean {
         val t = HtmlParser.toLines(r.body)
         for (b in BAD_WORDS) {
@@ -425,17 +534,37 @@ class RouterClient(hostInput: String, private val password: String) {
                 return false
             }
         }
-        if (looksLoggedIn(r.body)) {
+        // 接口返回 JSON：直接看字段判断，这是 SPA 固件唯一可靠的判据
+        val raw = r.body.trim()
+        if (raw.startsWith("{") || raw.startsWith("[")) {
+            val low = raw.lowercase()
+            val fail = JSON_FAIL.any { low.contains(it) }
+            val ok = JSON_OK.any { low.contains(it) }
+            if (fail && !ok) {
+                slog("     → JSON 响应判定失败")
+                return false
+            }
+            if (ok) {
+                slog("     → 验证通过：JSON 响应 $ok")
+                return true
+            }
+        }
+        if (!spaDetected && looksLoggedIn(r.body)) {
             slog("     → 验证通过：POST 响应已是后台页面")
             return true
         }
+        if (spaDetected) {
+            // SPA 的首页在登录前后长得一样，无法用 HTML 复检，只能认 JSON
+            slog("     → SPA 固件，HTML 无法复检登录态（响应长度 ${r.body.length}）")
+            return false
+        }
         val home = try {
-            get("/")
+            get(homeUrl)
         } catch (e: Exception) {
             slog("     → 复检首页异常: ${e.message}")
             return false
         }
-        pages["/"] = home.body
+        pages[homeUrl] = home.body
         if (looksLoggedIn(home.body)) {
             slog("     → 验证通过：首页已不是登录页")
             return true
@@ -448,10 +577,11 @@ class RouterClient(hostInput: String, private val password: String) {
         if (html.isBlank()) return false
         val low = html.lowercase()
         val t = HtmlParser.toLines(html)
-        // 已经能点到「退出/注销」，肯定不是登录页
-        val hasLogout = low.contains("logout") || low.contains("signout") ||
-                t.contains("退出") || t.contains("注销") || t.contains("登出")
-        if (hasLogout) return false
+        // 已经能点到「退出/注销」，肯定不是登录页。
+        // 注意：SPA 的 index.html 里 data-trans="logout" / data-bind="click:logout"
+        // 未登录时也照样存在，所以原文匹配 "logout" 不算数（见真机日志的误判）。
+        if (t.contains("退出登录") || t.contains("注销") || t.contains("登出") || t.contains("退出系统")) return false
+        if (low.contains("signout")) return false
         if (t.contains("请输入密码") || t.contains("需要授权")) return true
         if (low.contains("type=\"password\"") || low.contains("type=password") ||
             low.contains("type='password'") || low.contains("type=\"pwd\"")
@@ -478,10 +608,13 @@ class RouterClient(hostInput: String, private val password: String) {
                 if (low.contains(k)) h2++
             if (h2 >= 2) return true
         }
-        // 有退出/注销入口，基本说明已经在后台里了
-        if (low.contains("logout") || low.contains("signout") ||
-            t.contains("退出") || t.contains("注销") || t.contains("登出")
-        ) return true
+        // 有退出/注销入口，基本说明已经在后台里了。
+        // 但 SPA 的 index.html 里 data-trans="logout" 未登录时也存在，
+        // 所以只有当页面里根本没有密码输入框时，才拿这个当证据。
+        val hasPwBox = low.contains("type=\"password\"") || low.contains("type=password") ||
+                low.contains("type='password'")
+        if (!hasPwBox && (low.contains("logout") || low.contains("signout"))) return true
+        if (t.contains("退出登录") || t.contains("注销") || t.contains("登出")) return true
         return false
     }
 
@@ -500,7 +633,7 @@ class RouterClient(hostInput: String, private val password: String) {
                 if (pw == null) return null
                 val f = LinkedHashMap<String, String>()
                 f[pw.attr("name").ifBlank { pw.attr("id") }.ifBlank { "password" }] = password
-                return LoginForm(baseUrl + "/", "post", f)
+                return LoginForm(homeUrl, "post", f)
             }
             val fields = LinkedHashMap<String, String>()
             for (el in formEl.select("input, select, textarea")) {
@@ -523,7 +656,7 @@ class RouterClient(hostInput: String, private val password: String) {
             var action = formEl.absUrl("action")
             if (action.isBlank()) {
                 val raw = formEl.attr("action")
-                action = if (raw.isBlank()) baseUrl + "/" else baseUrl + "/" + raw.trimStart('/')
+                action = if (raw.isBlank()) homeUrl else baseUrl + "/" + raw.trimStart('/')
             }
             val method = formEl.attr("method").ifBlank { "post" }
             LoginForm(action, method, fields)
@@ -626,16 +759,29 @@ class RouterClient(hostInput: String, private val password: String) {
             }
         }
 
-        if (info.iccid == "--" || !SignalInfo.isReal(info.rssi)) {
-            for (u in scriptEndpoints()) {
+        if (!info.hasKeyData()) {
+            for (u in mineEndpoints()) {
                 if (fetched >= MAX_PAGES) break
+                if (visited.contains(u)) continue
                 grab(u)
             }
         }
 
         if (!info.hasData()) {
-            slog("所有页面都未解析到字段，用整段语料再兜底解析一次")
-            HtmlParser.merge(info, HtmlParser.parsePage(corpus.toString(), ""))
+            probeCgiInterfaces()
+            val probeCorpus = postLog.joinToString("\n")
+            if (probeCorpus.isNotBlank()) {
+                HtmlParser.merge(info, HtmlParser.parsePage(probeCorpus, "probe"))
+            }
+            if (!info.hasData()) {
+                slog("所有页面都未解析到字段，用整段语料再兜底解析一次")
+                HtmlParser.merge(info, HtmlParser.parsePage(corpus.toString(), ""))
+            }
+        }
+
+        if (!info.hasData() && spaDetected) {
+            slog("★ 结论：这是 JS 单页应用，纯 HTTP 请求拿不到数据。")
+            slog("  → 请点【网页模式(推荐)】，让真浏览器内核跑完页面 JS 再抓取。")
         }
 
         info.rawHtml = corpus.toString()
@@ -684,41 +830,115 @@ class RouterClient(hostInput: String, private val password: String) {
         return n
     }
 
-    /** 从页面引用的 JS 里挖后端接口 */
-    private fun scriptEndpoints(): List<String> {
+    /**
+     * 抓取页面引用的所有 JS，并从中挖出后端接口。
+     *
+     * SPA 固件（USR-G805 新 webui 就是）的数据全走 AJAX，静态 HTML 里一个值都没有，
+     * JS 就成了唯一能拿到接口清单的地方。抓到的 JS 会存进 pages，
+     * 于是会自动出现在诊断报告的「抓到的原始响应」里。
+     */
+    fun mineEndpoints(): List<String> {
         val scripts = LinkedHashSet<String>()
-        for ((_, body) in pages) {
+        for ((pageUrl, body) in pages) {
+            if (body.isBlank() || pageUrl.startsWith("POST ")) continue
             try {
-                val doc = Jsoup.parse(body, baseUrl + "/")
+                val doc = Jsoup.parse(body, pageUrl)
                 for (s in doc.select("script[src]")) {
                     val full = s.absUrl("src")
-                    if (full.startsWith(baseUrl) && full.lowercase().endsWith(".js")) scripts.add(full)
+                    if (full.startsWith(baseUrl) && full.endsWith(".js", true)) scripts.add(full)
                 }
             } catch (_: Exception) {
             }
         }
+        if (scripts.isEmpty()) {
+            slog("页面里没有引用同源 JS 文件，无法从 JS 挖接口")
+            return emptyList()
+        }
+
         val texts = StringBuilder()
         var n = 0
         for (s in scripts) {
-            if (n >= 6) break
+            if (n >= 10) break
             n++
+            if (pages.containsKey(s)) {
+                texts.append(pages[s]).append('\n')
+                continue
+            }
             try {
-                texts.append(get(s).body).append('\n')
+                val r = get(s)
+                if (r.code == 200 && r.body.isNotBlank()) {
+                    pages[s] = r.body
+                    texts.append(r.body).append('\n')
+                    slog("GET $s → ${r.code}, ${r.body.length} 字节")
+                } else {
+                    slog("GET $s → ${r.code}, ${r.body.length} 字节")
+                }
+            } catch (e: Exception) {
+                slog("GET $s → 异常: ${e.message}")
+            }
+        }
+
+        val found = LinkedHashSet<String>()
+        val patterns = listOf(
+            Regex("""["'](/cgi-bin/[A-Za-z0-9_\-/\.]{1,70}?\.(?:cgi|json|xml|asp|do|txt))["']"""),
+            Regex("""["'](/goform/[A-Za-z0-9_\-]{2,40})["']"""),
+            Regex("""["'](/(?:cgi-bin|cgi|api|webui|action)/[A-Za-z0-9_\-/\.]{1,70})["']"""),
+            Regex("""(?:url|action|path)\s*[:=]\s*["'](/?[A-Za-z0-9_\-/\.]{2,70}\.(?:cgi|json|xml|do))["']""")
+        )
+        for (p in patterns) {
+            try {
+                for (m in p.findAll(texts)) found.add(m.groupValues[1])
             } catch (_: Exception) {
             }
         }
-        val found = LinkedHashSet<String>()
-        try {
-            val re1 = Regex("""["'](/[A-Za-z0-9_\-/\.]{2,60}\.(?:cgi|json|xml|asp|html?|do))["']""")
-            for (m in re1.findAll(texts)) found.add(m.groupValues[1])
-            val re2 = Regex("""["'](/goform/[A-Za-z0-9_\-]{2,40})["']""")
-            for (m in re2.findAll(texts)) found.add(m.groupValues[1])
-        } catch (_: Exception) {
-        }
         val list = found.filter { u ->
-            !SKIP_WORDS.any { u.lowercase().contains(it) } && u != "/" && u.length > 3
+            u.length > 3 &&
+                    !u.lowercase().endsWith(".css") && !u.lowercase().endsWith(".png") &&
+                    !u.lowercase().endsWith(".ico") && !u.lowercase().endsWith(".js") &&
+                    !SKIP_WORDS.any { u.lowercase().contains(it) }
         }
-        if (list.isNotEmpty()) slog("从 JS 中发现候选接口: " + list.take(8).joinToString(", "))
-        return list.take(6).map { baseUrl + it }
+        if (list.isEmpty()) {
+            slog("看了 ${scripts.size} 个 JS，没挖到 /cgi-bin 之类的接口路径")
+        } else {
+            slog("★ 从 JS 挖到候选接口 ${list.size} 个：" + list.take(12).joinToString(", "))
+        }
+        return list.toList()
+    }
+
+    /**
+     * 对 /cgi-bin/*.cgi 逐个 POST 探一探，并把响应写进报告。
+     *
+     * 依据：真机日志里 GET /cgi-bin/status.cgi 返回 200 + "NOT POST REQUEST"，
+     * 说明这个接口存在、而且只认 POST —— 数据接口很可能就在这一批里。
+     */
+    private fun probeCgiInterfaces() {
+        slog("——— POST 探测 /cgi-bin 接口 ———")
+        val bodies = listOf(
+            "",
+            "{}",
+            "username=admin&password=" + enc(password)
+        )
+        var hits = 0
+        for (c in CGI_CANDIDATES) {
+            for (b in bodies) {
+                val r = try {
+                    post(c, b, homeUrl)
+                } catch (e: Exception) {
+                    continue
+                }
+                val txt = HtmlParser.toLines(r.body).replace('\n', ' ').take(160)
+                slog("  POST $c  body=[${if (b.isEmpty()) "(空)" else b.take(40)}] → HTTP ${r.code}, ${r.body.length} 字节")
+                if (txt.isNotBlank()) slog("     $txt")
+                val looksReal = r.code == 200 && r.body.length > 30 &&
+                        !r.body.contains("Access Error") && !r.body.contains("Document Error") &&
+                        !r.body.contains("NOT POST REQUEST")
+                if (looksReal) {
+                    hits++
+                    postLog.add("POST $c  body=[$b]  → HTTP ${r.code}\n" + r.body.take(4000))
+                }
+            }
+        }
+        if (hits == 0) slog("  这批接口都没给出有效响应（都返回了错误页）")
+        else slog("  有 $hits 个接口给出了非错误响应，已记入下方「POST 提交/响应」")
     }
 }

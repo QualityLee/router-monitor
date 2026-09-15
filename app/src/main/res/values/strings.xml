@@ -8,12 +8,14 @@
     <string name="btn_login">② 登录并获取</string>
     <string name="btn_refresh">刷新</string>
     <string name="btn_logout">退出</string>
-    <string name="btn_web">网页模式</string>
+    <string name="btn_web">网页模式(推荐)</string>
     <string name="btn_copy">复制诊断</string>
     <string name="btn_save">保存日志</string>
     <string name="btn_clear">清空</string>
     <string name="btn_wv_reload">重新打开</string>
-    <string name="btn_wv_grab">抓取本页数据</string>
+    <string name="btn_wv_login">自动登录</string>
+    <string name="btn_wv_grab">抓取本页</string>
+    <string name="btn_wv_export">导出接口记录</string>
 
     <string name="label_live">实时信息</string>
     <string name="label_log">诊断日志（可选中复制；登录失败时把这里的内容发我）</string>
