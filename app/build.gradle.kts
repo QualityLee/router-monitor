@@ -11,8 +11,8 @@ android {
         applicationId = "com.workbuddy.routermon"
         minSdk = 21          // 工控机常见 Android 5+
         targetSdk = 34
-        versionCode = 1
-        versionName = "1.0"
+        versionCode = 2
+        versionName = "1.1"
     }
 
     buildFeatures {
@@ -20,6 +20,9 @@ android {
     }
 
     compileOptions {
+        // Android 5.1(API 22) 上没有 java.util.stream / java.time，
+        // 打开 core library desugaring，避免 jsoup 等库在运行时缺类。
+        isCoreLibraryDesugaringEnabled = true
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
     }
@@ -35,6 +38,8 @@ android {
 }
 
 dependencies {
+    coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.0.4")
+
     implementation("androidx.core:core-ktx:1.12.0")
     implementation("androidx.appcompat:appcompat:1.6.1")
     implementation("com.google.android.material:material:1.11.0")
@@ -44,11 +49,7 @@ dependencies {
 
     // HTTP
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
-    implementation("com.squareup.okhttp3:logging-interceptor:4.12.0")
 
     // HTML 解析
     implementation("org.jsoup:jsoup:1.17.1")
-
-    // 后台轮询
-    implementation("androidx.work:work-runtime-ktx:2.9.0")
 }
