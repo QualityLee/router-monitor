@@ -25,7 +25,7 @@ import java.io.File
  * 网页模式 —— 这次对付 USR-G805 新 webui 的**主力方案**。
  *
  * 实测结论：G805 的后台是 Knockout.js 单页应用，静态 HTML 里一个值都没有，
- * 信号/ICCID 全靠页面 JS 通过 AJAX 从 /cgi-bin/*.cgi 拉。纯 HTTP 客户端永远抓不到。
+ * 信号/ICCID 全靠页面 JS 通过 AJAX 从 cgi-bin 下的接口拉。纯 HTTP 客户端永远抓不到。
  *
  * 所以这里让真浏览器内核把页面 JS 跑完，然后：
  *   1. 注入拦截器，记录每一次 XHR / fetch / jQuery.ajax 的

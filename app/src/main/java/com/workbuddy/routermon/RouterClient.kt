@@ -22,7 +22,7 @@ import java.util.concurrent.TimeUnit
  * 所以这里不写死接口：
  *   1. GET / 并**跟随跳转壳**（USR-G805 的 / 只返回 window.location.href="index.html"）
  *   2. 用 Jsoup 自动发现最终首页里 <form> 的 action / method / 字段名
- *   3. 页面里没有表单时，抓取它引用的 JS，从里面挖 /cgi-bin/*.cgi 之类的接口再逐个试
+ *   3. 页面里没有表单时，抓取它引用的 JS，从里面挖 cgi-bin 下的接口路径再逐个试
  *   4. 登录是否成功不靠 Set-Cookie 名字判断，而是「POST 返回的 JSON + 复检首页」
  *   5. 若首页是 JS 单页应用（G805 新 webui 就是），静态 HTML 里没有数据，
  *      会额外对 /cgi-bin 接口做 POST 探测，并把结论指向「网页模式」
@@ -911,7 +911,7 @@ class RouterClient(hostInput: String, private val password: String) {
     }
 
     /**
-     * 对 /cgi-bin/*.cgi 逐个 POST 探一探，并把响应写进报告。
+     * 对 /cgi-bin 下的 cgi 接口逐个 POST 探一探，并把响应写进报告。
      *
      * 依据：真机日志里 GET /cgi-bin/status.cgi 返回 200 + "NOT POST REQUEST"，
      * 说明这个接口存在、而且只认 POST —— 数据接口很可能就在这一批里。
