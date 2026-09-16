@@ -45,8 +45,8 @@ EXPECT_MANIFEST = [
     "android.permission.WRITE_EXTERNAL_STORAGE",
 ]
 
-EXPECT_VERSION = "1.4"
-STALE_VERSION = "1.3"
+EXPECT_VERSION = "1.5"
+STALE_VERSION = "1.4"
 
 
 def has_str(blob: bytes, s: str) -> bool:

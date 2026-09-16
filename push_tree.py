@@ -25,6 +25,7 @@ ROOT = os.path.dirname(os.path.abspath(__file__))
 FILES = [
     ".github/workflows/build.yml",
     ".gitignore",
+    "INTEGRATION.md",
     "README.md",
     "_test_parser.py",
     "_test_g805json.py",
@@ -35,6 +36,7 @@ FILES = [
     "_test_mine.js",
     "_split_js.py",
     "_verify_apk.py",
+    "_pack_handoff.py",
     "push_tree.py",
     "ci.py",
     "build.gradle.kts",
