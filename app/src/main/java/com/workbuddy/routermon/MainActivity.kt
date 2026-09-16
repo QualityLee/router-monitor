@@ -65,6 +65,12 @@ class MainActivity : AppCompatActivity() {
             lastWebInfo = info
             renderInfo(info)
             log("已接收网页模式的结果 ${info.summary()}")
+            // ★ v1.5：拿到真数据后停掉普通轮询，避免 10 秒后被空响应覆盖
+            if (pollJob?.isActive == true) {
+                pollJob?.cancel()
+                pollJob = null
+                log("  → 已停止普通轮询，避免自动刷新覆盖（点【③ 重新登录】可重新开轮询）")
+            }
         }
     }
 
@@ -167,7 +173,12 @@ class MainActivity : AppCompatActivity() {
             setButtons(true)
             if (res.first) {
                 log("登录成功 ✓ ${res.second}")
-                startPolling()
+                // ★ v1.5：若网页模式已有真数据，跳过普通轮询（否则 10 秒后会被空覆盖）
+                if (lastWebInfo != null && lastWebInfo.hasData()) {
+                    log("已有网页模式数据 ✓，跳过普通轮询（按【③ 重新登录】会重启轮询）")
+                } else {
+                    startPolling()
+                }
             } else {
                 log("登录失败 ✗ ${res.second}")
                 toast("登录未通过，请点【网页模式(推荐)】或【① 诊断自检】")
@@ -211,6 +222,8 @@ class MainActivity : AppCompatActivity() {
             while (true) {
                 delay(10_000)
                 val c = client ?: break
+                // ★ v1.5：网页模式已有数据就退出轮询，避免被空响应覆盖
+                if (lastWebInfo != null && lastWebInfo.hasData()) break
                 val info = withContext(Dispatchers.IO) {
                     try {
                         c.fetchSignalInfo()
@@ -218,7 +231,15 @@ class MainActivity : AppCompatActivity() {
                         null
                     }
                 }
-                info?.let { renderInfo(it) }
+                // ★ v1.5：本轮没拿到字段，且 UI 已经有真数据 → 不渲染（保留之前的）
+                if (info != null) {
+                    val currentHasData = binding.tvIccid.text?.toString()?.let { it != "--" && it.isNotBlank() } == true
+                    if (!info.hasData() && currentHasData) {
+                        log("刷新 ${nowTime()}  本轮普通模式未取到字段，保留已有数据")
+                        continue
+                    }
+                    renderInfo(info)
+                }
             }
         }
     }

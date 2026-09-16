@@ -1029,6 +1029,12 @@ class WebViewActivity : AppCompatActivity() {
         sb.append("（只读探测；写接口 proc_post / cgi-bin 一律不碰）\n")
 
         val todo = ArrayList<String>()
+        // ★ v1.5：先打 G805 真实在用的「大 cmd」+ multi_data=1 —— 一个 GET 全拿
+        // 真字段名是从用户真机的 webview.txt 报告里挖出来的：ziccid（ICCID 真名）/
+        // imei / sim_imsi / rssi / lte_rsrp / signalbar / network_provider ...
+        todo.add("wifi_coverage,m_ssid_enable,sn,imei,network_type,sub_network_type," +
+                 "rssi,rscp,lte_rsrp,imsi,sim_imsi,ziccid,signalbar,network_provider," +
+                 "simcard_roam,wan_ipaddr,uptime,lan_ipaddr,mac_address,ppp_status,sta_count")
         for (c in cmds) if (c.isNotBlank() && !todo.contains(c)) todo.add(c)
         for (c in FALLBACK_CMDS) if (!todo.contains(c)) todo.add(c)
 
@@ -1039,7 +1045,9 @@ class WebViewActivity : AppCompatActivity() {
         var ok = 0
         var json = 0
         for ((i, c) in list.withIndex()) {
-            val u = "http://$ip/reqproc/proc_get?cmd=" + URLEncoder.encode(c, "UTF-8")
+            // ★ v1.5：加 multi_data=1&isTest=false —— 这是让 G805 真分字段返回的关键
+            val u = "http://$ip/reqproc/proc_get?multi_data=1&isTest=false&cmd=" +
+                    URLEncoder.encode(c, "UTF-8")
             val r = httpProbe(u)
             if (r == null) {
                 sb.append("\n#").append(i + 1).append(" cmd=").append(c).append("\n    → 连接失败\n")

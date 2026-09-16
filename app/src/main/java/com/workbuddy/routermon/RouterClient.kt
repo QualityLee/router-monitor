@@ -1088,9 +1088,19 @@ class RouterClient(hostInput: String, private val password: String) {
      * ⚠️ 安全边界：**只发 GET**。写操作走 `proc_post`，一个都不发。
      */
     private fun probeG805ProcGet() {
-        slog("——— 原生直连探测 GET $PROC_GET（v1.4）———")
+        slog("——— 原生直连探测 GET $PROC_GET（v1.5）———")
 
         val cmds = LinkedHashSet<String>()
+        // ★ v1.5：先打 G805 真实在用的「大 cmd」+ multi_data=1 —— 一个 GET 全拿
+        // 这是从用户真机的 webview.txt 里挖出的字段名清单（XHR 请求 #10 / #13），
+        // 关键字段：ziccid（ICCID 真名）/ imei / sim_imsi / rssi / lte_rsrp / signalbar
+        cmds.add("wifi_coverage,m_ssid_enable,sn,imei,network_type,sub_network_type," +
+                 "rssi,rscp,lte_rsrp,imsi,sim_imsi,ziccid,signalbar,network_provider," +
+                 "simcard_roam,wan_ipaddr,uptime,lan_ipaddr,mac_address,ppp_status,sta_count")
+        // ★ 关键参数 multi_data=1：不带它 G805 把整串当一个 key，返回 {整串:""}（空）
+        // 已带 isTest=false：和真机浏览器行为一致，避免某些固件给假数据
+
+        // 从已抓业务 JS 里挖其他备用 cmd（兜底用）
         for ((_, body) in pages) {
             if (body.isBlank()) continue
             for (m in CMD_RE.findAll(body)) {
@@ -1098,16 +1108,19 @@ class RouterClient(hostInput: String, private val password: String) {
                 if (v.isNotEmpty() && v.length <= 300) cmds.add(v)
             }
         }
-        val fromJs = cmds.size
+        val fromJs = cmds.size - 1   // 减去刚加的第一条大 cmd
+
+        // 单字段兜底（如果大串被路由器拒绝，逐个试）
         for (c in FALLBACK_CMDS) cmds.add(c)
 
         val list = cmds.toList().take(40)
-        slog("  已抓语料里挖到 cmd $fromJs 个，加兜底候选共 ${cmds.size} 个；本次实打 ${list.size} 个")
+        slog("  大串 1 个 + 已挖 cmd $fromJs 个 + 兜底 ${FALLBACK_CMDS.size} 个 = 共 ${cmds.size} 个；本次实打 ${list.size} 个")
 
         var ok = 0
         var json = 0
         for ((i, c) in list.withIndex()) {
-            val u = "$PROC_GET?cmd=" + enc(c)
+            // ★ v1.5：加 multi_data=1&isTest=false —— 这是让 G805 真分字段返回的关键
+            val u = "$PROC_GET?multi_data=1&isTest=false&cmd=" + enc(c)
             val r = try {
                 get(u)
             } catch (e: Exception) {

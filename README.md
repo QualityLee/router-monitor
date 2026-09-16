@@ -6,7 +6,72 @@
 
 ---
 
-## 🎯 这版（v1.4）解决了什么
+## 🎯 这版（v1.5）解决了什么
+
+v1.4 装机后**网页模式能读到 SIM 卡卡号和信号值了**，但用户报了个新症状：
+
+> 用网页模式打开 web 能读取到 SIM 卡卡号及信号值了，但是从网页返回到 app 首页后自动刷新后数据又没有了。
+
+定位到两个根本问题，**都修了**。
+
+### 问题一：网页模式的结果被「自动刷新」覆盖
+
+`MainActivity.doLogin()` 成功后会启动 10 秒一次的 `startPolling()`；轮询每轮调一次
+`RouterClient.fetchSignalInfo()`，但普通模式只能拿到**空字段**（见问题二）。
+10 秒后这一轮空结果就会**把刚刚 WebViewActivity 传回来的真数据覆盖掉**。
+
+**修复（v1.5 三道闸）**：
+- `onResume()` 收到网页模式结果后**立刻停掉轮询**：`pollJob?.cancel()`
+- `startPolling()` 内部两道护栏：
+  ① 进入循环前若 `lastWebInfo.hasData()` 就 `break`，干脆不跑
+  ② 跑中每轮若新数据没字段、当前 UI 已有数据 → `continue` 跳过本轮（保留之前的）
+- `doLogin()` 成功后若 `lastWebInfo` 已有真数据 → 直接跳过 `startPolling()`
+
+### 问题二：普通模式的「原生直连实测」全返回空值
+
+之前以为"随便猜个字段名就能从 G805 拿到值"，结果用户的 diag.txt 告诉我们：
+**18 个候选字段名，全部 HTTP 200 但值都为空字符串**（除了 `signalbar` 和 `network_type` 两个），
+普通模式一直拿不到 ICCID / IMEI / IMSI / RSSI。
+
+从用户的 webview.txt 报告（1.2 MB 全量诊断，含完整业务 JS 源码）里挖出**两条被漏掉的真相**：
+
+#### 真相 A：ICCID 字段名是 `ziccid`，不是 `sim_iccid` / `iccid`
+
+报告 line 240-241 的 XHR #10 完整响应里，**字段名长得非常迷惑**：
+```json
+{"ziccid":"89861126208093092119","imei":"862790076742140","sim_imsi":"460113938676490", ...}
+```
+- `ziccid` ← ICCID 真名（G805 自己的诡异命名）
+- `sim_imsi` ← IMSI 真名（不是 `imsi`，`imsi` 字段在用户路由器上**永远返回空字符串**）
+- `lte_rsrp` ← LTE 时的 RSRP（不是 `rsrp`，`rscp` 是 3G 才用）
+
+#### 真相 B：必须带 `multi_data=1` 参数，否则 G805 把整串当一个 key 返回空
+
+不带 `multi_data=1` 的请求：响应是 `{"<整串字段名>":""}` ← **整串被当作字段名**
+带 `multi_data=1` 后：响应是 `{"network_type":"LTE","rssi":"-77","ziccid":"...","imei":"..."}` ← **真分字段**
+
+v1.4 的 probeG805ProcGet 完全没带这个参数，所以 40 个候选**全空**，根本不知道是真没数据还是协议没踩对。
+
+**修复（v1.5 三件事）**：
+- **probeG805ProcGet / probeProcGet 第一条就用 G805 真实在用的「大 cmd」+ multi_data=1**：
+  ```
+  wifi_coverage,m_ssid_enable,sn,imei,network_type,sub_network_type,
+  rssi,rscp,lte_rsrp,imsi,sim_imsi,ziccid,signalbar,network_provider,
+  simcard_roam,wan_ipaddr,uptime,lan_ipaddr,mac_address,ppp_status,sta_count
+  ```
+- **所有 proc_get 请求 URL 统一加 `multi_data=1&isTest=false`**
+- **HtmlParser.extractG805Json()**（新增）：识别 G805 返回的 flat JSON，
+  按 `ziccid → iccid / sim_imsi → imsi / lte_rsrp → rsrp / network_type → 网络制式 / ...`
+  的映射表填进 SignalInfo。不依赖 org.json，手写极简正则。
+
+### 现在普通模式不需要网页模式也能拿到全部字段
+
+之前 v1.4 三种模式链式接力（自检 → BFS → 挖接口 → 兜底字段名猜）全是空的。
+v1.5 直接用逆出的真协议 + 真字段名，**一个 GET 就齐**。
+
+---
+
+## 📜 v1.4 解决了什么
 
 v1.3 装机后导出的「网页模式全量诊断」**645,775 字符**，把最后一层窗户纸捅破了。
 
@@ -374,6 +439,24 @@ node _test_mine.js _js
 cmd 取值 (8): m_ssid_enable,... / AuthMode,passPhrase / station_list / lan_station_list ...
 goformId 取值 (7): SET_WIFI_SSID1_SETTINGS / SET_WIFI_SSID2_SETTINGS / SET_WIFI_INFO ...
 ✓ 已知 cmd 全部挖到（4/4）
+```
+
+### 5. G805 JSON 解析（v1.5 新增）
+
+`_test_g805json.py` 是 `HtmlParser.extractG805Json()` 的 Python 等价移植。
+G805 返回的是 flat JSON（不是 HTML 标签），所以单独测一套。
+
+```bash
+python _test_g805json.py
+```
+
+```json
+{"ziccid":"89861126208093092119","imei":"862790076742140","sim_imsi":"460113938676490", ...}
+```
+↑ 这条响应是从用户真机报告 `webview.txt` 行 240-241 抠出来的，断言 8 个字段
+（iccid / imei / imsi / rssi / rsrp / network_mode / operator / run_time）全中。
+外加 7 个边界用例（空对象 / 空字段值 / 转义引号 / 整串当 key 的空响应 / 普通 HTML）。
+
 ```
 
 ---

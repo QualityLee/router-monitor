@@ -137,6 +137,12 @@ object HtmlParser {
                 """(\d+\s*(?:天|小时|时|分钟|分|秒)[^\s]{0,8})"""))
             ?.let { info.runTime = it }
 
+        // ---- v1.5 新增：G805 /reqproc/proc_get 的 JSON 键值对直接解析 ----
+        // 路由器返回 {"ziccid":"...","imei":"...","rssi":"...","lte_rsrp":"..."}，
+        // 字段名是 G805 内部标识（不是中文标签），走专用映射表。
+        // 不做这个，普通模式（probeG805ProcGet）打出来一堆真数据 UI 也显示不出。
+        extractG805Json(raw, info)
+
         info.connected = info.hasData()
         return info
     }
@@ -155,6 +161,85 @@ object HtmlParser {
         if (!SignalInfo.isReal(dst.runTime) && SignalInfo.isReal(src.runTime)) dst.runTime = src.runTime
         if (dst.sourceUrl.isBlank() && src.sourceUrl.isNotBlank() && src.hasData()) dst.sourceUrl = src.sourceUrl
         dst.connected = dst.hasData()
+    }
+
+    // ------------------------------------------------------------------
+    //  v1.5 新增：从 G805 /reqproc/proc_get 返回的 JSON 里直接拿字段
+    // ------------------------------------------------------------------
+
+    /**
+     * G805 的真实读接口返回 `{"key":"value",...}` 这种 flat JSON，键名是路由器
+     * 内部字段标识（不是中文标签）。常见键（从真机响应里挖出的）：
+     *   - ziccid        → ICCID（注意 G805 用 `ziccid`，不是 `iccid`）
+     *   - imei          → IMEI
+     *   - imsi / sim_imsi → IMSI（两个键都认；sim_imsi 优先）
+     *   - rssi          → RSSI（dBm）
+     *   - lte_rsrp      → RSRP（LTE）
+     *   - rscp          → RSCP（3G 时的同位置）
+     *   - network_type + sub_network_type → 网络制式（拼成 "LTE(FDD_LTE)"）
+     *   - network_provider → 运营商
+     *   - uptime        → 运行时间
+     *
+     * 不依赖 org.json：手写一个极简正则解析，只取字符串值（不处理嵌套）。
+     * 已存在真值就不覆盖（避免和 HTML 标签路径互相打架）。
+     */
+    private fun extractG805Json(raw: String, info: SignalInfo) {
+        // 找最外层的 { ... }（非嵌套版）。G805 的响应是 flat，不会有 }{
+        val start = raw.indexOf('{')
+        if (start < 0) return
+        val end = raw.indexOf('}', start + 1)
+        if (end < 0) return
+        val body = raw.substring(start, end + 1)
+
+        fun jstr(key: String): String? {
+            // 匹配 "key":"value"，value 里可以有转义 \"
+            // 不用三引号字符串（lint 误报），改成显式字符串拼接
+            val pat = "\"" + Regex.escape(key) + "\"\\s*:\\s*\"((?:[^\"\\\\]|\\\\.)*)\""
+            val re = Regex(pat)
+            val m = re.find(body) ?: return null
+            val v = m.groupValues[1].replace("\\\"", "\"").trim()
+            // 过滤：空值、过长（>60 字符）
+            return if (v.isEmpty() || v.length > 60) null else v
+        }
+
+        // ICCID：ziccid 是 G805 真实键名
+        if (!SignalInfo.isReal(info.iccid)) jstr("ziccid")?.let { info.iccid = it }
+
+        // IMEI
+        if (!SignalInfo.isReal(info.imei)) jstr("imei")?.let { info.imei = it }
+
+        // IMSI：sim_imsi 优先（user 真机响应里 sim_imsi 有真值，imsi 是空）
+        if (!SignalInfo.isReal(info.imsi)) {
+            val simImsi = jstr("sim_imsi")
+            if (simImsi != null) info.imsi = simImsi
+            else jstr("imsi")?.let { info.imsi = it }
+        }
+
+        // RSSI
+        if (!SignalInfo.isReal(info.rssi)) jstr("rssi")?.let { info.rssi = it }
+
+        // RSRP：lte_rsrp 优先，rscp 兜底（3G 时只有 rscp）
+        if (!SignalInfo.isReal(info.rsrp)) {
+            val lteRsrp = jstr("lte_rsrp")
+            if (lteRsrp != null) info.rsrp = lteRsrp
+            else jstr("rscp")?.let { info.rsrp = it }
+        }
+
+        // 网络制式：拼 network_type(sub_network_type)
+        if (!SignalInfo.isReal(info.networkMode)) {
+            val nt = jstr("network_type")
+            val snt = jstr("sub_network_type")
+            if (nt != null) {
+                val mode = if (snt != null && snt.isNotBlank()) "$nt($snt)" else nt
+                info.networkMode = mode
+            }
+        }
+
+        // 运营商
+        if (!SignalInfo.isReal(info.operator)) jstr("network_provider")?.let { info.operator = it }
+
+        // 运行时间（uptime 一般是 " 0h 11m 22s" 这种）
+        if (!SignalInfo.isReal(info.runTime)) jstr("uptime")?.let { info.runTime = it }
     }
 
     // ------------------------------------------------------------------
