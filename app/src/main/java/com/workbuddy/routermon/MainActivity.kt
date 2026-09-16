@@ -174,7 +174,9 @@ class MainActivity : AppCompatActivity() {
             if (res.first) {
                 log("登录成功 ✓ ${res.second}")
                 // ★ v1.5：若网页模式已有真数据，跳过普通轮询（否则 10 秒后会被空覆盖）
-                if (lastWebInfo != null && lastWebInfo.hasData()) {
+                // Kotlin smart cast 不允许 var 属性 null-check 后直接用，所以先锁 local val
+                val web = lastWebInfo
+                if (web != null && web.hasData()) {
                     log("已有网页模式数据 ✓，跳过普通轮询（按【③ 重新登录】会重启轮询）")
                 } else {
                     startPolling()
@@ -223,7 +225,9 @@ class MainActivity : AppCompatActivity() {
                 delay(10_000)
                 val c = client ?: break
                 // ★ v1.5：网页模式已有数据就退出轮询，避免被空响应覆盖
-                if (lastWebInfo != null && lastWebInfo.hasData()) break
+                // Kotlin smart cast 不允许 var 属性 null-check 后直接用，所以先锁 local val
+                val web = lastWebInfo
+                if (web != null && web.hasData()) break
                 val info = withContext(Dispatchers.IO) {
                     try {
                         c.fetchSignalInfo()
